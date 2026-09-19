@@ -1,0 +1,6 @@
+reference/
+release/*.plugin
+*.plugin
+multicam/multicam.app
+thirdparty/
+.DS_Store

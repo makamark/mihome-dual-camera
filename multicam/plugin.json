@@ -1,0 +1,13 @@
+{
+  "id": "multicam",
+  "version": "0.4.0",
+  "upgrade_url": "http://192.0.2.221:8080/multicam/release.json",
+  "name": {
+    "zh": "多摄像头拼图",
+    "en": "Multi-Camera Mosaic"
+  },
+  "description": {
+    "zh": "多路小米摄像头拼图画布接入（go2rtc 取流 + 软解 + YUV420P 合成）",
+    "en": "Multi-camera mosaic input via go2rtc capture, software decode and YUV420P composition"
+  }
+}

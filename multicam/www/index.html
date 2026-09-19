@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-ui-state="booting">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>多摄像头拼图 · 设置</title>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <div class="brand">多摄像头拼图 <span class="ver" id="ver"></span></div>
+    <div class="state" id="state-badge">加载中…</div>
+  </header>
+
+  <section class="card" id="status-card">
+    <h2>运行状态</h2>
+    <div class="status-grid" id="status-grid"></div>
+  </section>
+
+  <section class="card" id="auth-card">
+    <h2>账号授权 <span class="hint">（米家账号 · 短信验证码）</span></h2>
+    <div id="auth-body"></div>
+  </section>
+
+  <section class="card">
+    <h2>实时画面与检测区域</h2>
+    <p class="hint">点击"开启预览"后显示设备当前拼接画布的实时流。叠加的检测区域（Zone）来自设备侧配置——在设备总览界面上绘制/修改，此处只读展示，约 30 秒自动刷新。</p>
+    <div class="preview-bar">
+      <button id="pv-toggle" class="btn small">开启预览</button>
+      <span class="hint" id="pv-hint">预览默认关闭：拉流期间设备会持续 JPEG 编码（约 5–15% CPU），不用时请关闭（闲置会自动关闭）。</span>
+    </div>
+    <div class="preview-wrap">
+      <img id="pv-src" alt="" crossorigin="anonymous">
+      <canvas id="pv-canvas"></canvas>
+    </div>
+    <p class="hint" id="zone-info"></p>
+  </section>
+
+  <section class="card">
+    <h2>摄像头 <button id="cam-refresh" class="btn small">刷新设备列表</button></h2>
+    <p class="hint">打开面板时自动加载米家设备目录（约 10 秒）；下拉选机后点底部"保存并应用"生效。</p>
+    <div id="cam-list"></div>
+    <button id="cam-add" class="btn small">+ 添加摄像头</button>
+  </section>
+
+  <section class="card">
+    <h2>输出</h2>
+    <div class="row">
+      <label>推流帧率</label>
+      <select id="fps">
+        <option value="3">3 fps（省电）</option>
+        <option value="5">5 fps（推荐）</option>
+        <option value="10">10 fps（高负载）</option>
+      </select>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>米家事件映射 <span class="hint">（来自米家网关插件，保存后立即生效）</span></h2>
+    <p class="hint">每个检测槽位触发时发送的米家事件名。注意与上方区域设置的槽位保持语义一致。</p>
+    <table class="mapping" id="mapping-table">
+      <thead><tr><th>槽位</th><th>有人事件名</th><th>无人事件名</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <button id="mapping-save" class="btn">保存米家映射</button>
+  </section>
+
+  <div class="save-bar">
+    <span id="save-msg"></span>
+    <button id="save" class="btn primary big">保存并应用</button>
+  </div>
+</div>
+<script type="module" src="assets/app.js"></script>
+</body>
+</html>
