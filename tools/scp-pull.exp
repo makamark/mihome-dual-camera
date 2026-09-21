@@ -1,0 +1,16 @@
+#!/usr/bin/expect -f
+# 用法: scp-pull.exp <设备路径> <本地目标>
+set timeout 300
+log_user 0
+set remote [lindex $argv 0]
+set local [lindex $argv 1]
+spawn scp -O -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ainice@192.0.2.142:$remote $local
+expect {
+  "assword:" { send "REDACTED\r" }
+  timeout { puts "TIMEOUT"; exit 1 }
+}
+expect {
+  eof {}
+  timeout { puts "TIMEOUT"; exit 1 }
+}
+puts "PULL_DONE"

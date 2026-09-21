@@ -1,0 +1,13 @@
+#!/usr/bin/expect -f
+set timeout 25
+log_user 0
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ainice@192.0.2.142 "mkdir -p ~/.ssh && grep -qf <(echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILidzIOrEWLGYWG3xYB7iTt4zfblAEToPSxDK43XcYW2 mark@MacBook-Air-2.local') ~/.ssh/authorized_keys 2>/dev/null || echo 'PUBKEY' >> ~/.ssh/authorized_keys; chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys; echo KEY_INSTALLED"
+expect {
+  "assword:" { send "REDACTED\r" }
+  timeout { puts "TIMEOUT"; exit 1 }
+}
+expect {
+  "KEY_INSTALLED" { puts "OK" }
+  timeout { puts "NO_CONFIRM"; exit 1 }
+}
+expect eof

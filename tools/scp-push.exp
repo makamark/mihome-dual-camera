@@ -1,0 +1,12 @@
+#!/usr/bin/expect -f
+# 用法: scp-push.exp <本地文件> <设备目标路径>
+set timeout 60
+log_user 1
+set local [lindex $argv 0]
+set remote [lindex $argv 1]
+spawn scp -O -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $local ainice@192.0.2.142:$remote
+expect {
+  "assword:" { send "REDACTED\r" }
+  timeout { puts "TIMEOUT"; exit 1 }
+}
+expect eof
