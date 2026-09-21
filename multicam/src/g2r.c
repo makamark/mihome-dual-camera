@@ -278,12 +278,16 @@ int g2r_start(g2r_instance_t *inst, char *err, size_t err_cap)
     fclose(fp);
     chmod(yaml, 0600);
 
-    /* Go 运行时内存上限（CPU 有余量，GC 频率换堆：8MiB×2 实例） */
+    /* Go 运行时内存上限（CPU 有余量，GC 频率换堆：8MiB×2 实例）。
+       GOMAXPROCS=1：单核 A53 上多 P 只会增加 OS 线程需求（sysmon/retake 等），
+       曾在系统线程配额收紧时致 newosproc errno=11 崩溃循环。 */
     setenv("GOMEMLIMIT", "8MiB", 1);
     setenv("GOGC", "30", 1);
+    setenv("GOMAXPROCS", "1", 1);
     inst->pid = fork();
     unsetenv("GOMEMLIMIT");
     unsetenv("GOGC");
+    unsetenv("GOMAXPROCS");
     if (inst->pid == 0) {
         prctl(PR_SET_PDEATHSIG, SIGKILL); /* 父进程死后内核收尸，杜绝孤儿占端口 */
         int log = open(logp, O_WRONLY | O_CREAT | O_TRUNC, 0600);

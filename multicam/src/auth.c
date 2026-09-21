@@ -115,9 +115,11 @@ int auth_service_start(const char *data_dir, const char *g2r_bin,
 
     setenv("GOMEMLIMIT", "8MiB", 1);
     setenv("GOGC", "30", 1);
+    setenv("GOMAXPROCS", "1", 1);
     pid_t pid = fork();
     unsetenv("GOMEMLIMIT");
     unsetenv("GOGC");
+    unsetenv("GOMAXPROCS");
     if (pid == 0) {
         prctl(PR_SET_PDEATHSIG, SIGKILL);
         int log = open(logp, O_WRONLY | O_CREAT | O_TRUNC, 0600);

@@ -54,9 +54,11 @@ int catalog_ensure_instance(const char *data_dir, const char *mh_yaml,
     /* fork 发现实例（仅 xiaomi 目录模块，无 camera 源；随父进程死 + 内存上限） */
     setenv("GOMEMLIMIT", "16MiB", 1);
     setenv("GOGC", "40", 1);
+    setenv("GOMAXPROCS", "1", 1);
     pid_t pid = fork();
     unsetenv("GOMEMLIMIT");
     unsetenv("GOGC");
+    unsetenv("GOMAXPROCS");
     if (pid == 0) {
         prctl(PR_SET_PDEATHSIG, SIGKILL);
         setsid();
