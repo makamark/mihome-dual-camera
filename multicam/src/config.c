@@ -27,20 +27,27 @@ int config_load(multicam_config_t *cfg, const char *path)
     if (cJSON_IsObject(item)) {
         sub = cJSON_GetObjectItem(item, "version");
         if (cJSON_IsNumber(sub)) cfg->layout_version = sub->valueint;
-        sub = cJSON_GetObjectItem(item, "tile");
-        if (cJSON_IsArray(sub) && cJSON_GetArraySize(sub) == 2) {
-            cfg->tile_w = cJSON_GetArrayItem(sub, 0)->valueint;
-            cfg->tile_h = cJSON_GetArrayItem(sub, 1)->valueint;
-        }
         sub = cJSON_GetObjectItem(item, "type");
         if (cJSON_IsString(sub)) {
+            snprintf(cfg->layout_type, sizeof(cfg->layout_type), "%s", sub->valuestring);
             int rows = 0, cols = 0;
             if (sscanf(sub->valuestring, "%dx%d", &rows, &cols) == 2 &&
                 rows > 0 && cols > 0)
                 cfg->layout_cols = cols;
         }
+        sub = cJSON_GetObjectItem(item, "tile");
+        if (cJSON_IsArray(sub) && cJSON_GetArraySize(sub) == 2) {
+            cfg->tile_w = cJSON_GetArrayItem(sub, 0)->valueint;
+            cfg->tile_h = cJSON_GetArrayItem(sub, 1)->valueint;
+        }
     }
-    if (cfg->tile_w <= 0 || cfg->tile_h <= 0) {
+    /* 默认使用 crop_1x2 左右并排裁切（400x480 × 2 = 800x480，精确匹配 5:3 模型输入） */
+    if (!cfg->layout_type[0] || !strcmp(cfg->layout_type, "crop_1x2")) {
+        snprintf(cfg->layout_type, sizeof(cfg->layout_type), "crop_1x2");
+        cfg->tile_w = 400;
+        cfg->tile_h = 480;
+        cfg->layout_cols = 2;
+    } else if (cfg->tile_w <= 0 || cfg->tile_h <= 0) {
         cfg->tile_w = 848;
         cfg->tile_h = 480;
     }
@@ -103,13 +110,21 @@ int config_load(multicam_config_t *cfg, const char *path)
         if (cJSON_IsString(sub)) snprintf(cam->source, sizeof(cam->source), "%s", sub->valuestring);
         sub = cJSON_GetObjectItem(it, "tile");
         cam->tile = cJSON_IsNumber(sub) ? sub->valueint : cfg->camera_count;
+        sub = cJSON_GetObjectItem(it, "crop_x");
+        cam->crop_x = cJSON_IsNumber(sub) ? sub->valueint : -1;
         sub = cJSON_GetObjectItem(it, "enabled");
         cam->enabled = !cJSON_IsBool(sub) || cJSON_IsTrue(sub);
         if (cam->tile + 1 > canvas_w) canvas_w = cam->tile + 1;
         cfg->camera_count++;
     }
-    canvas_w = canvas_w ? canvas_w : 2;   /* n_slots = 最大 tile 槽位 + 1 */
-    {
+    if (!strcmp(cfg->layout_type, "crop_1x2")) {
+        cfg->canvas_w = 800;
+        cfg->canvas_h = 480;
+        cfg->tile_w = 400;
+        cfg->tile_h = 480;
+        cfg->layout_cols = 2;
+    } else {
+        canvas_w = canvas_w ? canvas_w : 2;   /* n_slots = 最大 tile 槽位 + 1 */
         int cols = cfg->layout_cols > 0 ? cfg->layout_cols : canvas_w;
         int rows;
         if (cols > canvas_w) cols = canvas_w;

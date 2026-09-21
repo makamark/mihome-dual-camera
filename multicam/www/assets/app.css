@@ -50,12 +50,22 @@ body {
 .area-props { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
 .area-props label { font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 3px; }
 
-.cam-row { display: grid; grid-template-columns: 26px 1fr 130px 90px 200px; gap: 8px; align-items: center; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; }
-.cam-row .tile-label { font-weight: 600; color: var(--muted); }
+.cam-card { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; background: var(--card); }
+.cam-row { display: grid; grid-template-columns: 24px 60px 1fr 1.6fr; gap: 8px; align-items: center; }
+.cam-row .tile-label { font-weight: 600; color: var(--primary); font-size: 13px; }
 .cam-row select, .cam-row input, .area-props input, .area-props select, #fps, #area-select {
-  font: inherit; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--text); max-width: 100%;
+  font: inherit; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); max-width: 100%;
 }
 .cam-row .st { font-size: 12px; color: var(--muted); }
+
+.crop-control { margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--line); }
+.crop-header { display: flex; align-items: center; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.crop-val { font-weight: 600; color: var(--text); }
+.crop-presets { display: flex; gap: 4px; }
+.btn.micro { padding: 1px 6px; font-size: 11px; }
+.crop-slider { width: 100%; cursor: pointer; accent-color: var(--primary); margin: 4px 0; }
+.crop-track-vis { position: relative; height: 14px; background: #16181b; border: 1px solid var(--line); border-radius: 3px; overflow: hidden; }
+.crop-window-indicator { position: absolute; top: 0; bottom: 0; background: rgba(76, 167, 255, 0.4); border: 1px solid var(--primary); border-radius: 2px; }
 
 .row { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
 table.mapping { border-collapse: collapse; width: 100%; margin-bottom: 10px; }

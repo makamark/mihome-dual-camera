@@ -64,6 +64,7 @@ static int handle_status_get(ainice_bridge_response_t *response)
     cJSON *s = cJSON_AddObjectToObject(r, "status");
     cJSON_AddBoolToObject(s, "valid", st.valid);
     cJSON_AddBoolToObject(s, "pushing", st.pushing);
+    cJSON_AddStringToObject(s, "layout_type", st.layout_type[0] ? st.layout_type : "crop_1x2");
     cJSON_AddNumberToObject(s, "canvas_w", st.canvas_w);
     cJSON_AddNumberToObject(s, "canvas_h", st.canvas_h);
     cJSON_AddNumberToObject(s, "tile_w", st.tile_w);
@@ -94,6 +95,9 @@ static int handle_status_get(ainice_bridge_response_t *response)
         cJSON_AddNumberToObject(o, "reconnects", (double)t->reconnects);
         cJSON_AddNumberToObject(o, "decoded", (double)t->decoded);
         cJSON_AddNumberToObject(o, "keyint_ms", t->keyint_ms);
+        cJSON_AddNumberToObject(o, "crop_x", t->crop_x);
+        cJSON_AddNumberToObject(o, "src_w", t->src_w);
+        cJSON_AddNumberToObject(o, "src_h", t->src_h);
         cJSON_AddNumberToObject(o, "g2r_port", t->g2r_port);
         cJSON_AddNumberToObject(o, "g2r_rss_kb", t->g2r_rss_kb);
         cJSON_AddBoolToObject(o, "g2r_alive", t->g2r_alive);

@@ -145,6 +145,12 @@ int g2r_make_patched_bin(const char *g2r_bin, int port, const char *data_dir,
                          int index, char *tmp_out, size_t tmp_cap,
                          char *err, size_t err_cap)
 {
+    /* 端口 8554 是原始常量，直接使用原始二进制，无需复制！
+       避免在仅 32MB 的 /data 分区重复写入 8.3MB 大文件导致存储耗尽 */
+    if (port == 8554) {
+        snprintf(tmp_out, tmp_cap, "%s", g2r_bin);
+        return 0;
+    }
     char src[512];
     snprintf(src, sizeof(src), "%s", g2r_bin);
     FILE *in = fopen(src, "rb");
@@ -370,7 +376,12 @@ void g2r_stop(g2r_instance_t *inst)
             usleep(100 * 1000);
         }
         kill((pid_t)inst->pid, SIGKILL);
-        waitpid((pid_t)inst->pid, NULL, WNOHANG);
+        for (int i = 0; i < 20; i++) {
+            int status;
+            pid_t w = waitpid((pid_t)inst->pid, &status, WNOHANG);
+            if (w > 0 || (w < 0 && errno == ECHILD)) break;
+            usleep(50 * 1000);
+        }
         inst->pid = 0;
     }
     char sock[512];

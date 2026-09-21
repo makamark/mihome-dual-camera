@@ -72,6 +72,7 @@ function nSlots() {
 function renderStatus() {
   const s = state.status;
   if (!s || !s.valid) { $("state-badge").textContent = "未就绪"; $("state-badge").className = "state warn"; return; }
+  canvasResize();
   const bad = (s.tiles || []).some(t => t.enabled && t.gray);
   const badge = $("state-badge");
   badge.textContent = s.pushing ? (bad ? "运行中（部分画面置灰）" : "运行中") : "连接管线中…";
@@ -98,32 +99,66 @@ function renderCameras() {
   const wrap = $("cam-list");
   wrap.innerHTML = "";
   (state.cfg.cameras || []).forEach((cam, i) => {
-    const row = document.createElement("div");
-    row.className = "cam-row";
+    const card = document.createElement("div");
+    card.className = "cam-card";
     const did = camDid(cam);
     const opts = ['<option value="__manual__">手动源…</option>']
       .concat(state.devices.map(d =>
         `<option value="${d.id}" ${String(d.id) === did ? "selected" : ""}>${d.name || d.id}（${d.model || "?"} @ ${devIp(d) || "?"}）</option>`).join(""));
-    row.innerHTML = `
-      <input type="checkbox" ${cam.enabled !== false ? "checked" : ""} title="启用">
-      <span class="tile-label">Tile</span>
-      <input type="number" min="0" max="7" value="${cam.tile ?? i}" title="槽位">
-      <select class="dev">${opts}</select>
-      <input class="src" type="text" placeholder="xiaomi:// 或 rtsp:// 源" value="${cam.source || ""}">`;
-    row.querySelector('input[type=checkbox]').onchange = e => { cam.enabled = e.target.checked; markDirty(); };
-    row.querySelector('input[type=number]').onchange = e => { cam.tile = Math.max(0, Math.min(7, e.target.value | 0)); markDirty(); };
-    row.querySelector(".dev").onchange = e => {
+    const cropX = cam.crop_x != null && cam.crop_x >= 0 ? cam.crop_x : 224;
+    cam.crop_x = cropX;
+
+    card.innerHTML = `
+      <div class="cam-row">
+        <input type="checkbox" class="cam-en" ${cam.enabled !== false ? "checked" : ""} title="启用">
+        <span class="tile-label">Tile ${cam.tile ?? i}</span>
+        <select class="dev">${opts}</select>
+        <input class="src" type="text" placeholder="xiaomi:// 或 rtsp:// 源" value="${cam.source || ""}">
+      </div>
+      <div class="crop-control">
+        <div class="crop-header">
+          <span>水平画框取景 (400×480)</span>
+          <span class="crop-val">X: ${cropX} (${cropX === 0 ? "靠左" : cropX === 448 ? "靠右" : cropX === 224 ? "居中" : "自定义"})</span>
+          <div class="crop-presets">
+            <button type="button" class="btn micro" data-x="0">靠左</button>
+            <button type="button" class="btn micro" data-x="224">居中</button>
+            <button type="button" class="btn micro" data-x="448">靠右</button>
+          </div>
+        </div>
+        <input type="range" class="crop-slider" min="0" max="448" step="2" value="${cropX}">
+        <div class="crop-track-vis" title="取景范围占全画面 (400 / 848)">
+          <div class="crop-window-indicator" style="left: ${(cropX / 848 * 100).toFixed(1)}%; width: ${(400 / 848 * 100).toFixed(1)}%;"></div>
+        </div>
+      </div>`;
+    card.querySelector(".cam-en").onchange = e => { cam.enabled = e.target.checked; markDirty(); };
+    card.querySelector(".dev").onchange = e => {
       if (e.target.value === "__manual__") return;
       const dev = state.devices.find(d => String(d.id) === e.target.value);
       if (dev) {
         cam.source = sourceFor(dev, acct);
         cam.did = String(dev.id); cam.name = dev.name; cam.model = dev.model; cam.localip = dev.localip;
-        row.querySelector(".src").value = cam.source;
+        card.querySelector(".src").value = cam.source;
         markDirty();
       }
     };
-    row.querySelector(".src").onchange = e => { cam.source = e.target.value.trim(); markDirty(); };
-    wrap.appendChild(row);
+    card.querySelector(".src").onchange = e => { cam.source = e.target.value.trim(); markDirty(); };
+
+    const slider = card.querySelector(".crop-slider");
+    const valLabel = card.querySelector(".crop-val");
+    const indicator = card.querySelector(".crop-window-indicator");
+    function updateCrop(x) {
+      x = Math.max(0, Math.min(448, parseInt(x, 10) & ~1));
+      cam.crop_x = x;
+      slider.value = x;
+      valLabel.textContent = `X: ${x} (${x === 0 ? "靠左" : x === 448 ? "靠右" : x === 224 ? "居中" : "自定义"})`;
+      indicator.style.left = `${(x / 848 * 100).toFixed(1)}%`;
+      markDirty();
+    }
+    slider.oninput = e => updateCrop(e.target.value);
+    card.querySelectorAll(".crop-presets button").forEach(btn => {
+      btn.onclick = () => updateCrop(btn.dataset.x);
+    });
+    wrap.appendChild(card);
   });
 }
 
@@ -184,8 +219,8 @@ function pvKeep() {
 $("pv-toggle").onclick = () => (previewOn ? previewStop() : previewStart());
 function canvasResize() {
   if (!state.status) return;
-  canvas.width = state.status.canvas_w || TILE_W * 2;
-  canvas.height = state.status.canvas_h || TILE_H;
+  canvas.width = state.status.canvas_w || 800;
+  canvas.height = state.status.canvas_h || 480;
 }
 function drawOverlay() {
   const img = $("pv-src");
@@ -197,6 +232,21 @@ function drawOverlay() {
     ctx.fillStyle = "#7a828c";
     ctx.font = "14px sans-serif";
     ctx.fillText("预览未开启（检测区域仍显示）", 12, 24);
+  }
+  /* crop_1x2 模式下绘制左右路中分线与标识 */
+  if (canvas.width === 800 && canvas.height === 480) {
+    ctx.save();
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.25)";
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(400, 0);
+    ctx.lineTo(400, 480);
+    ctx.stroke();
+    ctx.font = "12px sans-serif";
+    ctx.fillStyle = "rgba(255, 255, 255, 0.4)";
+    ctx.fillText("Tile 0 · 左路 (400×480)", 8, 18);
+    ctx.fillText("Tile 1 · 右路 (400×480)", 408, 18);
+    ctx.restore();
   }
   if (!deviceZones) return;
   deviceZones.zones.forEach(z => {

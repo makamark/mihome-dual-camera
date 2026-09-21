@@ -1,6 +1,6 @@
 {
   "id": "multicam",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "upgrade_url": "http://192.0.2.221:8080/multicam/release.json",
   "name": {
     "zh": "多摄像头拼图",

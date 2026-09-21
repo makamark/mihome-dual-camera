@@ -285,3 +285,43 @@ int64_t capture_paint_tile(capture_t *cap, uint8_t *dst_y, uint8_t *dst_u, uint8
     pthread_mutex_unlock(&cap->lock);
     return age;
 }
+
+int64_t capture_paint_crop(capture_t *cap, uint8_t *dst_y, uint8_t *dst_u, uint8_t *dst_v,
+                           int dst_y_stride, int dst_c_stride,
+                           int crop_x, int crop_y,
+                           int crop_w, int crop_h)
+{
+    pthread_mutex_lock(&cap->lock);
+    if (!cap->slot.data) {
+        pthread_mutex_unlock(&cap->lock);
+        return -1;
+    }
+    int w = cap->slot.w, h = cap->slot.h;
+    if (crop_w <= 0 || crop_h <= 0 || w < crop_w || h < crop_h) {
+        pthread_mutex_unlock(&cap->lock);
+        return -2;
+    }
+    crop_w &= ~1;
+    crop_h &= ~1;
+    crop_x &= ~1;
+    crop_y &= ~1;
+    if (crop_x < 0) crop_x = (w - crop_w) / 2 & ~1;
+    if (crop_y < 0) crop_y = (h - crop_h) / 2 & ~1;
+    if (crop_x + crop_w > w) crop_x = (w - crop_w) & ~1;
+    if (crop_y + crop_h > h) crop_y = (h - crop_h) & ~1;
+
+    const uint8_t *src = cap->slot.data;
+    size_t ysz = (size_t)w * h, usz = ysz / 4;
+    for (int row = 0; row < crop_h; row++)
+        memcpy(dst_y + (size_t)row * dst_y_stride,
+               src + (size_t)(crop_y + row) * w + crop_x, crop_w);
+    for (int row = 0; row < crop_h / 2; row++) {
+        memcpy(dst_u + (size_t)row * dst_c_stride,
+               src + ysz + (size_t)(crop_y / 2 + row) * (w / 2) + crop_x / 2, crop_w / 2);
+        memcpy(dst_v + (size_t)row * dst_c_stride,
+               src + ysz + usz + (size_t)(crop_y / 2 + row) * (w / 2) + crop_x / 2, crop_w / 2);
+    }
+    int64_t age = now_ms() - cap->slot.updated_ms;
+    pthread_mutex_unlock(&cap->lock);
+    return age;
+}

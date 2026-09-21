@@ -21,11 +21,14 @@ typedef struct {
     int g2r_port;
     int g2r_rss_kb;       /* go2rtc 子进程常驻内存（0=不在场） */
     bool g2r_alive;
+    int crop_x;           /* 当前水平裁切起点 */
+    int src_w, src_h;     /* 源画面原始分辨率 */
 } panel_tile_t;
 
 typedef struct {
     bool valid;
     bool pushing;         /* 推流会话活 */
+    char layout_type[32]; /* 布局类型，如 "crop_1x2" */
     int canvas_w, canvas_h, fps;
     int tile_w, tile_h;   /* 单 tile 尺寸（面板叠加/标定的几何换算用） */
     int layout_cols;      /* tile 网格列数（1 = 竖排） */

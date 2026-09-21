@@ -10,6 +10,7 @@
 typedef struct {
     char id[64];
     int tile;
+    int crop_x;           /* 水平裁切起点（0..448，-1 表示自动居中 (src_w - 400)/2） */
     int enabled;
     char source[256];
 } multicam_camera_t;
@@ -19,9 +20,10 @@ typedef struct {
 
 typedef struct {
     int layout_version;
+    char layout_type[32]; /* "crop_1x2"（默认推荐左右并排裁切）或旧版 "1x2" / "2x1" */
     int layout_cols;      /* layout.type "行x列" 的列数；0 = 单行横排（兼容旧配置） */
-    int tile_w, tile_h;   /* 运行模式由实际流决定；selftest 用配置值 */
-    int canvas_w, canvas_h;
+    int tile_w, tile_h;   /* crop_1x2 下为 400x480，旧版由实际流决定 */
+    int canvas_w, canvas_h; /* crop_1x2 下为 800x480 (5:3) */
     int fps;
     char data_dir[256];   /* go2rtc yaml/socket/日志的根 */
     char g2r_bin[256];    /* go2rtc 二进制 */

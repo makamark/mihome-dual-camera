@@ -68,7 +68,6 @@ int auth_service_start(const char *data_dir, const char *g2r_bin,
 {
     char sock[512], yaml[512], logp[512];
     paths(data_dir, sock, sizeof(sock), yaml, sizeof(yaml), logp, sizeof(logp));
-    struct stat st;
     int rc = -1;
 
     pthread_mutex_lock(&g_auth_lock);
@@ -104,13 +103,7 @@ int auth_service_start(const char *data_dir, const char *g2r_bin,
     fclose(fp);
     chmod(yaml, 0600);
 
-    char patched[512];
-    if (g2r_make_patched_bin(g2r_bin, AUTH_PORT, data_dir, AUTH_INDEX,
-                              patched, sizeof(patched), err, err_cap) != 0) {
-        pthread_mutex_unlock(&g_auth_lock);
-        return -1;
-    }
-    snprintf(g_auth_bin_tmp, sizeof(g_auth_bin_tmp), "%s", patched);
+    snprintf(g_auth_bin_tmp, sizeof(g_auth_bin_tmp), "%s", g2r_bin);
     unlink(sock);
 
     setenv("GOMEMLIMIT", "8MiB", 1);
@@ -125,7 +118,7 @@ int auth_service_start(const char *data_dir, const char *g2r_bin,
         int log = open(logp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
         if (log >= 0) { dup2(log, 1); dup2(log, 2); close(log); }
         setsid();
-        execl(patched, patched, "-config", yaml, (char *)NULL);
+        execl(g_auth_bin_tmp, g_auth_bin_tmp, "-config", yaml, (char *)NULL);
         _exit(127);
     }
     if (pid < 0) {
@@ -163,7 +156,12 @@ void auth_service_stop(void)
             usleep(100 * 1000);
         }
         kill(g_auth_pid, SIGKILL);
-        waitpid(g_auth_pid, NULL, WNOHANG);
+        for (int i = 0; i < 20; i++) {
+            int status;
+            pid_t w = waitpid(g_auth_pid, &status, WNOHANG);
+            if (w > 0 || (w < 0 && errno == ECHILD)) break;
+            usleep(50 * 1000);
+        }
         g_auth_pid = 0;
     }
     if (g_auth_bin_tmp[0] && strstr(g_auth_bin_tmp, "/tmp/go2rtc-p"))

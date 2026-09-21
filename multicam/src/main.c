@@ -206,6 +206,7 @@ static int run(const multicam_config_t *cfg)
     uint8_t *canvas = NULL;
     push_t push = {0};
     int tile_w = 0, tile_h = 0, canvas_w = 0, canvas_h = 0;
+    int src_w = 0, src_h = 0;
     bool push_opened = false;
     pthread_t watcher_th;
     bool watcher_started = false;
@@ -310,29 +311,43 @@ static int run(const multicam_config_t *cfg)
                         cam_cfg[j], cfg->cameras[cam_cfg[j]].id, caps[j].last_error);
                 continue;
             }
-            if (tile_w == 0) { tile_w = w; tile_h = h; }
-            else if (w != tile_w || h != tile_h) {
+            if (src_w == 0) { src_w = w; src_h = h; }
+            else if (w != src_w || h != src_h) {
                 fprintf(stderr, "multicam: cam[%d](%s) 分辨率 %dx%d 与首路 %dx%d 不一致（v1 要求一致）\n",
-                        cam_cfg[j], cfg->cameras[cam_cfg[j]].id, w, h, tile_w, tile_h);
+                        cam_cfg[j], cfg->cameras[cam_cfg[j]].id, w, h, src_w, src_h);
                 goto out;
             }
         }
-        if (tile_w == 0) {
-            /* 全部降级：回退配置 tile 尺寸发灰画布，进程保持常驻等 watcher 救回 */
-            tile_w = cfg->tile_w;
-            tile_h = cfg->tile_h;
-            fprintf(stderr, "multicam: 所有摄像头均无首帧，按配置 %dx%d 全灰运行\n",
-                    tile_w, tile_h);
+        if (src_w == 0) {
+            /* 全部降级：回退 848x480 */
+            src_w = 848;
+            src_h = 480;
+            fprintf(stderr, "multicam: 所有摄像头均无首帧，按缺省 %dx%d 全灰运行\n",
+                    src_w, src_h);
+        }
+        if (!strcmp(cfg->layout_type, "crop_1x2")) {
+            tile_w = 400;
+            tile_h = src_h;
+            cols = 2;
+            rows = 1;
+            n_slots = 2;
+            canvas_w = 800;
+            canvas_h = tile_h;
+            fprintf(stderr, "multicam: 左右并排裁切（源 %dx%d，各裁 400x%d）→ 画布 %dx%d(5:3) @%dfps\n",
+                    src_w, src_h, tile_h, canvas_w, canvas_h, cfg->fps);
+        } else {
+            tile_w = src_w;
+            tile_h = src_h;
+            cols = cfg->layout_cols > 0 ? cfg->layout_cols : n_slots;
+            if (cols > n_slots) cols = n_slots;
+            if (cols < 1) cols = 1;
+            rows = (n_slots + cols - 1) / cols;
+            canvas_w = tile_w * cols;
+            canvas_h = tile_h * rows;
+            fprintf(stderr, "multicam: %d 路 %dx%d（%d 槽位，%d列×%d行）→ 画布 %dx%d @%dfps\n",
+                    n, tile_w, tile_h, n_slots, cols, rows, canvas_w, canvas_h, cfg->fps);
         }
     }
-    cols = cfg->layout_cols > 0 ? cfg->layout_cols : n_slots;
-    if (cols > n_slots) cols = n_slots;
-    if (cols < 1) cols = 1;
-    rows = (n_slots + cols - 1) / cols;
-    canvas_w = tile_w * cols;
-    canvas_h = tile_h * rows;
-    fprintf(stderr, "multicam: %d 路 %dx%d（%d 槽位，%d列×%d行）→ 画布 %dx%d @%dfps\n",
-            n, tile_w, tile_h, n_slots, cols, rows, canvas_w, canvas_h, cfg->fps);
 
     canvas = malloc((size_t)canvas_w * canvas_h * 3 / 2);
     if (!canvas) { fprintf(stderr, "multicam: oom\n"); goto out; }
@@ -376,6 +391,7 @@ static int run(const multicam_config_t *cfg)
                 session_failures++;
                 panel_status_t pst0 = {0};
                 pst0.valid = true;
+                snprintf(pst0.layout_type, sizeof(pst0.layout_type), "%s", cfg->layout_type);
                 pst0.canvas_w = canvas_w; pst0.canvas_h = canvas_h;
                 pst0.tile_w = tile_w; pst0.tile_h = tile_h;
                 pst0.layout_cols = cols;
@@ -385,8 +401,8 @@ static int run(const multicam_config_t *cfg)
                 for (int s = 0; s < n_slots; s++) {
                     int owner = slot_owner[s];
                     if (owner < 0) continue;
-                    snprintf(pst0.tiles[s].cam_id, sizeof(pst0.tiles[s].cam_id), "%s",
-                             cfg->cameras[cam_cfg[owner]].id);
+                    const multicam_camera_t *c = &cfg->cameras[cam_cfg[owner]];
+                    snprintf(pst0.tiles[s].cam_id, sizeof(pst0.tiles[s].cam_id), "%s", c->id);
                     pst0.tiles[s].enabled = true;
                     pst0.tiles[s].gray = true;
                     pst0.tiles[s].age_ms = capture_age(&caps[owner]);
@@ -394,6 +410,9 @@ static int run(const multicam_config_t *cfg)
                     pst0.tiles[s].reconnects = caps[owner].reconnects;
                     pst0.tiles[s].decoded = caps[owner].slot.frame_count;
                     pst0.tiles[s].keyint_ms = (int)capture_keyint_ms(&caps[owner]);
+                    pst0.tiles[s].crop_x = c->crop_x;
+                    pst0.tiles[s].src_w = src_w;
+                    pst0.tiles[s].src_h = src_h;
                     pst0.tiles[s].g2r_port = inst[owner].port;
                     pst0.tiles[s].g2r_rss_kb = (int)pid_rss_kb(inst[owner].pid);
                     pst0.tiles[s].g2r_alive = inst[owner].pid > 0;
@@ -428,8 +447,15 @@ static int run(const multicam_config_t *cfg)
                         uint8_t *y = canvas + (size_t)oy * canvas_w + ox;
                         uint8_t *u = canvas + ysz + (size_t)(oy / 2) * (canvas_w / 2) + ox / 2;
                         uint8_t *v = u + (size_t)(canvas_w / 2) * (canvas_h / 2);
-                        age = capture_paint_tile(&caps[owner], y, u, v,
-                                                 canvas_w, canvas_w / 2, tile_w, tile_h);
+                        if (!strcmp(cfg->layout_type, "crop_1x2")) {
+                            int cx = cfg->cameras[cam_cfg[owner]].crop_x;
+                            age = capture_paint_crop(&caps[owner], y, u, v,
+                                                     canvas_w, canvas_w / 2,
+                                                     cx, 0, tile_w, tile_h);
+                        } else {
+                            age = capture_paint_tile(&caps[owner], y, u, v,
+                                                     canvas_w, canvas_w / 2, tile_w, tile_h);
+                        }
                     }
                     if (age < 0 || age > stale_limit) {
                         if (!slot_gray[s]) {
@@ -481,6 +507,7 @@ static int run(const multicam_config_t *cfg)
                 panel_status_t pst = {0};
                 pst.valid = true;
                 pst.pushing = true;
+                snprintf(pst.layout_type, sizeof(pst.layout_type), "%s", cfg->layout_type);
                 pst.canvas_w = canvas_w; pst.canvas_h = canvas_h;
                 pst.tile_w = tile_w; pst.tile_h = tile_h;
                 pst.layout_cols = cols;
@@ -490,8 +517,8 @@ static int run(const multicam_config_t *cfg)
                     int owner = slot_owner[s];
                     panel_tile_t *pt = &pst.tiles[s];
                     if (owner < 0) continue;
-                    snprintf(pt->cam_id, sizeof(pt->cam_id), "%s",
-                             cfg->cameras[cam_cfg[owner]].id);
+                    const multicam_camera_t *c = &cfg->cameras[cam_cfg[owner]];
+                    snprintf(pt->cam_id, sizeof(pt->cam_id), "%s", c->id);
                     pt->enabled = true;
                     pt->gray = slot_gray[s];
                     pt->age_ms = capture_age(&caps[owner]);
@@ -499,6 +526,9 @@ static int run(const multicam_config_t *cfg)
                     pt->reconnects = caps[owner].reconnects;
                     pt->decoded = caps[owner].slot.frame_count;
                     pt->keyint_ms = (int)capture_keyint_ms(&caps[owner]);
+                    pt->crop_x = c->crop_x;
+                    pt->src_w = src_w;
+                    pt->src_h = src_h;
                     pt->g2r_port = inst[owner].port;
                     pt->g2r_rss_kb = (int)pid_rss_kb(inst[owner].pid);
                     pt->g2r_alive = inst[owner].pid > 0;

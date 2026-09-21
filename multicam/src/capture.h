@@ -64,4 +64,12 @@ int64_t capture_paint_tile(capture_t *cap, uint8_t *dst_y, uint8_t *dst_u, uint8
                            int dst_y_stride, int dst_c_stride,
                            int expect_w, int expect_h);
 
+/* 按指定 (crop_x, crop_y, crop_w, crop_h) 从源画面裁切并拷入目标画布平面。
+   crop_x/y < 0 时自动居中裁切。各参数及步长须为偶数。
+   返回帧龄毫秒；无帧 -1；尺寸不足 -2。 */
+int64_t capture_paint_crop(capture_t *cap, uint8_t *dst_y, uint8_t *dst_u, uint8_t *dst_v,
+                           int dst_y_stride, int dst_c_stride,
+                           int crop_x, int crop_y,
+                           int crop_w, int crop_h);
+
 #endif
