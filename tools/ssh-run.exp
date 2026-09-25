@@ -4,7 +4,7 @@ log_user 1
 set cmd [lindex $argv 0]
 spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ainice@192.0.2.142 $cmd
 expect {
-  "assword:" { send "REDACTED\r" }
+  "assword:" { send "$env(AINICE_SSH_PASS)\r" }
   timeout { puts "CONNECT_TIMEOUT"; exit 1 }
 }
 expect {

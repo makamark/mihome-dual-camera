@@ -3,7 +3,7 @@ set timeout 120
 log_user 1
 spawn scp -3 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ainice@192.0.2.142:/tmp/pull-sdk.tgz /tmp/plugin-analysis/device/
 expect {
-  "assword:" { send "REDACTED\r" }
+  "assword:" { send "$env(AINICE_SSH_PASS)\r" }
   timeout { puts "TIMEOUT"; exit 1 }
 }
 expect eof

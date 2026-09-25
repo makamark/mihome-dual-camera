@@ -5,7 +5,7 @@ set src [lindex $argv 0]
 set dst [lindex $argv 1]
 spawn scp -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ainice@192.0.2.142:$src $dst
 expect {
-  "assword:" { send "REDACTED\r" }
+  "assword:" { send "$env(AINICE_SSH_PASS)\r" }
   timeout { puts "TIMEOUT"; exit 1 }
 }
 expect {

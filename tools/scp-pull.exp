@@ -6,7 +6,7 @@ set remote [lindex $argv 0]
 set local [lindex $argv 1]
 spawn scp -O -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ainice@192.0.2.142:$remote $local
 expect {
-  "assword:" { send "REDACTED\r" }
+  "assword:" { send "$env(AINICE_SSH_PASS)\r" }
   timeout { puts "TIMEOUT"; exit 1 }
 }
 expect {

@@ -9,10 +9,10 @@
 |---|---|
 | 硬件 | Sophgo SG2002（单核 A53 + NPU 0.5T + 硬件 VDEC/JPEG 解码） |
 | 系统 | Buildroot，kernel 5.10，**无板端 gcc**，Python3 可用 |
-| 地址 | `192.0.2.142` |
-| SSH | `ainice` / `REDACTED`（需 PTY，用 `tools/ssh-run.exp "<cmd>"`） |
+| 地址 | 设备局域网 IP（见部署说明） |
+| SSH | `ainice` / `$AINICE_SSH_PASS`（需 PTY，用 `tools/ssh-run.exp "<cmd>"`） |
 | 文件 | `tools/scp-push.exp <本地> <设备路径>`（scp 需 `-O`；打包用 BusyBox `tar cf`） |
-| Web | admin / `1234`；`POST /api/auth/login` 返回 csrf_token，写操作带 `X-CSRF-Token` 头 |
+| Web | admin / `$AINICE_WEB_PASS`；`POST /api/auth/login` 返回 csrf_token，写操作带 `X-CSRF-Token` 头 |
 | 预览 | `/mjpeg/stream`（需 session cookie） |
 | 开发文档 | 设备上 `~/DEVELOPER.md`，SDK 示例在 `/examples`（已镜像到 `reference/device/`） |
 
@@ -24,7 +24,7 @@ reference/                  逆向资料（原 /tmp/plugin-analysis，只读参�
   device/examples/          官方插件示例：c-bridge、sdk/bitstream（推流关键）、vision、presence…
   migateway/                米家网关插件完整 C 源码（插件骨架参考）
   mhcamera/ + mhcamera.dis  原厂摄像头插件逆向（拉流/token 逻辑）
-tools/                      ssh/scp expect 脚本（内嵌密码，勿外传）
+tools/                      ssh/scp expect 脚本（密码经环境变量 AINICE_SSH_PASS 注入）
 experiments/                2026-09-16 拼图推送实验产物
 docs/                       方案与设计文档（待写）
 ```
