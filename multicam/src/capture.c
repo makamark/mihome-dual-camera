@@ -231,6 +231,85 @@ int capture_start(capture_t *cap, const char *url)
     return 0;
 }
 
+int capture_snapshot_jpeg(capture_t *cap, uint8_t *buf, size_t buf_cap)
+{
+    if (!cap || !buf || buf_cap < 4096) return -1;
+    pthread_mutex_lock(&cap->lock);
+    if (!cap->slot.data) {
+        pthread_mutex_unlock(&cap->lock);
+        return -1;
+    }
+    int w = cap->slot.w, h = cap->slot.h;
+
+    /* 编码器/输入帧懒初始化（槽位分辨率按首帧锁定，运行期不变） */
+    AVCodecContext *enc = cap->snap_enc;
+    if (!enc) {
+        const AVCodec *c = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
+        if (!c) { pthread_mutex_unlock(&cap->lock); return -1; }
+        enc = avcodec_alloc_context3(c);
+        if (!enc) { pthread_mutex_unlock(&cap->lock); return -1; }
+        enc->width = w;
+        enc->height = h;
+        enc->pix_fmt = AV_PIX_FMT_YUVJ420P;
+        enc->time_base = (AVRational){1, 5};
+        enc->qmin = 8;   /* 质量/体积平衡：848x480 室内场景 ~40-90KB */
+        enc->qmax = 8;
+        if (avcodec_open2(enc, c, NULL) < 0) {
+            avcodec_free_context(&enc);
+            pthread_mutex_unlock(&cap->lock);
+            return -1;
+        }
+        AVFrame *f = av_frame_alloc();
+        if (!f) {
+            avcodec_free_context(&enc);
+            pthread_mutex_unlock(&cap->lock);
+            return -1;
+        }
+        /* format/尺寸必须先于 get_buffer 设置，否则缓冲分配失败 */
+        f->format = enc->pix_fmt;
+        f->width = w;
+        f->height = h;
+        if (av_frame_get_buffer(f, 32) < 0) {
+            av_frame_free(&f);
+            avcodec_free_context(&enc);
+            pthread_mutex_unlock(&cap->lock);
+            return -1;
+        }
+        cap->snap_enc = enc;
+        cap->snap_frm = f;
+    }
+    AVFrame *f = cap->snap_frm;
+
+    /* 槽位（连续平面）→ 编码帧（行距对齐），~600KB 拷贝在锁内 ~1ms */
+    size_t ysz = (size_t)w * h, usz = ysz / 4;
+    const uint8_t *src = cap->slot.data;
+    for (int row = 0; row < h; row++)
+        memcpy(f->data[0] + (size_t)row * f->linesize[0], src + (size_t)row * w, w);
+    for (int row = 0; row < h / 2; row++) {
+        memcpy(f->data[1] + (size_t)row * f->linesize[1], src + ysz + (size_t)row * (w / 2), w / 2);
+        memcpy(f->data[2] + (size_t)row * f->linesize[2], src + ysz + usz + (size_t)row * (w / 2), w / 2);
+    }
+    pthread_mutex_unlock(&cap->lock);
+
+    /* 编码在锁外：enc/frm 仅 bridge 线程（单线程串行服务）访问 */
+    f->pts = cap->snap_pts++;
+    if (avcodec_send_frame(enc, f) < 0) return -1;
+    AVPacket *pkt = av_packet_alloc();
+    if (!pkt) return -1;
+    int n = -1;
+    if (avcodec_receive_packet(enc, pkt) >= 0) {
+        if ((size_t)pkt->size <= buf_cap) {
+            memcpy(buf, pkt->data, pkt->size);
+            n = pkt->size;
+        } else {
+            n = -2;
+        }
+        av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+    return n;
+}
+
 void capture_stop(capture_t *cap)
 {
     cap->stop = true;
@@ -241,6 +320,12 @@ void capture_stop(capture_t *cap)
     pthread_mutex_destroy(&cap->lock);
     free(cap->slot.data);
     cap->slot.data = NULL;
+    if (cap->snap_enc) {
+        AVCodecContext *e = cap->snap_enc;
+        avcodec_free_context(&e);
+        cap->snap_enc = NULL;
+    }
+    av_frame_free((AVFrame **)&cap->snap_frm);
 }
 
 void capture_dims(capture_t *cap, int *w, int *h)

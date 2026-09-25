@@ -65,7 +65,10 @@ static int extract_token_section(const char *yaml_path, char *out, size_t cap)
         }
     }
     fclose(fp);
-    if (used == 0) return -1;
+    /* 有效性校验：vendor 写回偶发把 xiaomi: 段写成纯空白（实例曾凭空 token
+       拨号 credential_rejected 死循环）。抽出的段必须含 token blob（V1: 前缀），
+       否则按无 token 处理，让调用方继续回退下一来源（快照 / mh yaml）。 */
+    if (used == 0 || !strstr(out, "V1:")) return -1;
     return 0;
 }
 

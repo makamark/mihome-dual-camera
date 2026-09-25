@@ -51,4 +51,12 @@ void panel_stop(void);
 /* 主循环每秒发布快照。 */
 void panel_status_publish(const panel_status_t *st);
 
+/* run() 启动捕获后绑定 tile→捕获映射（bridge preview.full 取景器快照用），
+   cap_by_tile[tile] = 捕获下标或 -1；重载/退出前传 NULL 解绑。 */
+void panel_bind_captures(void *caps, const int *cap_by_tile, int n);
+
+/* 主循环每帧调用：面板 source.set 的待办换源请求，有则返回 true 并取出。
+   src 由调用方提供缓冲（建议 512 字节）。 */
+bool panel_take_source_change(int *tile_out, char *src, size_t cap);
+
 #endif

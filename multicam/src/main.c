@@ -162,7 +162,7 @@ static void *g2r_watcher(void *arg)
         }
         for (int i = 0; i < ctx->count; i++) {
             g2r_instance_t *g = &ctx->inst[i];
-            if (g->pid != 0 || !g->username[0]) continue;
+            if (g->pid != 0 || !g->username[0] || g->frozen) continue;
             /* 重建来源：进程崩溃（上面 waitpid 已排程）或 restart_pending
                （初始启动失败降级 / 源长期不健康，由主循环置位） */
             if (g->restart_pending && next_try[i] == 0) {
@@ -289,6 +289,8 @@ static int run(const multicam_config_t *cfg)
         }
         cap_started[j] = true;
     }
+    /* 取景器快照绑定：tile → 捕获下标（bridge preview.full 用） */
+    panel_bind_captures(caps, slot_owner, MULTICAM_MAX_TILES);
 
     /* 等首帧以确定 tile 尺寸；降级容忍：至少一路有帧即可（其余路由 watcher 补救） */
     {
@@ -435,6 +437,75 @@ static int run(const multicam_config_t *cfg)
                 }
 #endif
                 auth_idle_tick();   /* 授权实例空闲 10 分钟自动回收 */
+
+                /* 面板下拉换源：就地重建该路 go2rtc/捕获，不重启进程。
+                   重建会阻塞主循环数秒（拨号/收线程），期间画布暂挂（另一路
+                   恢复推送后自动跟上）；watcher 经 g->frozen 让路防并发重建。 */
+                {
+                    int chg_tile = -1;
+                    char chg_src[512];
+                    if (panel_take_source_change(&chg_tile, chg_src, sizeof(chg_src))
+                        && chg_tile >= 0 && chg_tile < MULTICAM_MAX_TILES) {
+                        int owner = slot_owner[chg_tile];
+                        if (owner >= 0) {
+                            g2r_instance_t *g = &inst[owner];
+                            multicam_camera_t *cam = &cfg->cameras[cam_cfg[owner]];
+                            fprintf(stderr, "multicam: tile %d 运行时换源 → %s\n", chg_tile, chg_src);
+                            snprintf(cam->source, sizeof(cam->source), "%s", chg_src);
+                            capture_stop(&caps[owner]);
+                            cap_started[owner] = false;
+                            g->frozen = true;
+                            g2r_stop(g);
+                            char err[256];
+                            if (!strncmp(chg_src, "rtsp://", 7)) {
+                                g->pid = 0;   /* 转直连形态 */
+                                if (capture_start(&caps[owner], chg_src) == 0)
+                                    cap_started[owner] = true;
+                            } else {
+                                snprintf(g->source, sizeof(g->source), "%s", chg_src);
+                                g->restart_pending = false;
+                                if (g2r_start(g, err, sizeof(err)) == 0) {
+                                    snprintf(urls[owner], sizeof(urls[owner]),
+                                             "rtsp://%s:%s@127.0.0.1:%d/stream",
+                                             g->username, g->password, g->port);
+                                    if (capture_start(&caps[owner], urls[owner]) == 0)
+                                        cap_started[owner] = true;
+                                } else {
+                                    fprintf(stderr, "multicam: 换源 g2r 启动失败: %s\n", err);
+                                    g->restart_pending = true;
+                                }
+                            }
+                            g->frozen = false;
+                            fill_gray_tile(canvas, canvas_w, canvas_h, chg_tile, cols, tile_w, tile_h);
+                            slot_gray[chg_tile] = true;
+                            gray_since[chg_tile] = (int64_t)now_us() / 1000;
+                            snprintf(slot_note[chg_tile], sizeof(slot_note[chg_tile]), "换源中");
+                        }
+                    }
+                }
+
+                /* 自愈：换源失败/启动失败导致捕获缺失的启用路，重试 capture_start。
+                   capture 线程内部自带断流重连，这里只补"线程不存在"的洞；
+                   xiaomi 路须等 go2rtc 实例就绪（watcher 负责重建）。 */
+                for (int s = 0; s < n_slots; s++) {
+                    int owner = slot_owner[s];
+                    if (owner < 0 || cap_started[owner]) continue;
+                    const multicam_camera_t *c = &cfg->cameras[cam_cfg[owner]];
+                    const char *pull;
+                    if (!strncmp(c->source, "rtsp://", 7)) {
+                        pull = c->source;
+                    } else {
+                        g2r_instance_t *g = &inst[owner];
+                        if (g->pid <= 0 || !g->username[0]) continue;
+                        snprintf(urls[owner], sizeof(urls[owner]),
+                                 "rtsp://%s:%s@127.0.0.1:%d/stream",
+                                 g->username, g->password, g->port);
+                        pull = urls[owner];
+                    }
+                    fprintf(stderr, "multicam: capture[%d] 自愈重启\n", owner);
+                    if (capture_start(&caps[owner], pull) == 0)
+                        cap_started[owner] = true;
+                }
                 for (int s = 0; s < n_slots; s++) {
                     int owner = slot_owner[s];
                     int64_t age = -1;
@@ -547,6 +618,7 @@ static int run(const multicam_config_t *cfg)
 
 out:
     if (watcher_started) pthread_join(watcher_th, NULL);
+    panel_bind_captures(NULL, NULL, 0);   /* 先解绑，bridge 不再摸到停用中的捕获 */
     for (int j = 0; j < n; j++)
         if (cap_started[j]) capture_stop(&caps[j]);
     for (int i = 0; i < MULTICAM_MAX_TILES; i++)

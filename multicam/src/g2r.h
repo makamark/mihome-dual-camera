@@ -22,6 +22,7 @@ typedef struct {
 
     bool running;
     volatile bool restart_pending; /* 源不健康/启动失败，请求 watcher 重建 */
+    volatile bool frozen;          /* 主循环运行时换源中：watcher 暂不重建该实例 */
     long pid;
 } g2r_instance_t;
 

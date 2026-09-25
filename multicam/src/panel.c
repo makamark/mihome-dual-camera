@@ -1,6 +1,7 @@
 #include "panel.h"
 #include "auth.h"
 #include "catalog.h"
+#include "capture.h"
 #include "multicam.h"
 #include "vendor/cJSON.h"
 #include <ainice/bridge.h>
@@ -19,6 +20,27 @@ static pthread_t g_bridge_th;
 static bool g_bridge_started = false;
 static pthread_mutex_t g_status_lock = PTHREAD_MUTEX_INITIALIZER;
 static panel_status_t g_status;
+
+/* tile→捕获映射（run() 启动捕获后绑定，preview.full 快照用） */
+static pthread_mutex_t g_caps_lock = PTHREAD_MUTEX_INITIALIZER;
+static capture_t *g_caps;
+static int g_cap_by_tile[MULTICAM_MAX_TILES];
+
+void panel_bind_captures(void *caps, const int *cap_by_tile, int n)
+{
+    pthread_mutex_lock(&g_caps_lock);
+    g_caps = caps;
+    for (int i = 0; i < MULTICAM_MAX_TILES; i++)
+        g_cap_by_tile[i] = (cap_by_tile && i < n) ? cap_by_tile[i] : -1;
+    pthread_mutex_unlock(&g_caps_lock);
+}
+
+static int64_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 /* 配置保存的原子写：tmp + fsync + rename */
 static int write_file_atomic(const char *path, const char *data, size_t len)
@@ -203,6 +225,179 @@ static int handle_config_set(cJSON *params, ainice_bridge_response_t *response)
     return reply_json(response, r);
 }
 
+/* 取景器快照（preview.full）：把 tile 对应捕获的全幅原画编一帧 JPEG 回给面板。
+   每 tile 一份缓存，150ms 内重复请求直接回缓存（拖动跟手靠前端本地画框）。 */
+#define SNAP_BUF_CAP (256 * 1024)
+typedef struct {
+    uint8_t *buf;
+    size_t len;
+    int64_t ms;
+} snap_cache_t;
+static snap_cache_t g_snap_cache[MULTICAM_MAX_TILES];
+
+static size_t b64_encode(const uint8_t *in, size_t n, char *out)
+{
+    static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0REDACTED9+/";
+    size_t o = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        if (i + 1 < n) v |= (uint32_t)in[i + 1] << 8;
+        if (i + 2 < n) v |= in[i + 2];
+        out[o++] = T[(v >> 18) & 63];
+        out[o++] = T[(v >> 12) & 63];
+        out[o++] = (i + 1 < n) ? T[(v >> 6) & 63] : '=';
+        out[o++] = (i + 2 < n) ? T[v & 63] : '=';
+    }
+    out[o] = 0;
+    return o;
+}
+
+/* 运行时换源（source.set）：bridge 线程校验+写配置文件+置待办；
+   主循环 take 后就地重建该路（g2r/捕获），不重启进程。 */
+static pthread_mutex_t g_src_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool g_src_pending = false;
+static int g_src_tile = -1;
+static char g_src_url[512];
+
+bool panel_take_source_change(int *tile_out, char *src, size_t cap)
+{
+    pthread_mutex_lock(&g_src_lock);
+    if (!g_src_pending) {
+        pthread_mutex_unlock(&g_src_lock);
+        return false;
+    }
+    *tile_out = g_src_tile;
+    snprintf(src, cap, "%s", g_src_url);
+    g_src_pending = false;
+    g_src_tile = -1;
+    pthread_mutex_unlock(&g_src_lock);
+    return true;
+}
+
+static int handle_source_set(cJSON *params, ainice_bridge_response_t *response)
+{
+    int tile = -1;
+    cJSON *j = cJSON_GetObjectItem(params, "tile");
+    if (cJSON_IsNumber(j)) tile = j->valueint;
+    j = cJSON_GetObjectItem(params, "source");
+    const char *src = cJSON_IsString(j) ? j->valuestring : NULL;
+
+    cJSON *r = resp_ok();
+    if (tile < 0 || tile >= MULTICAM_MAX_TILES || !src || !src[0]) {
+        cJSON_AddStringToObject(r, "error", "参数缺失或非法（tile/source）");
+        return reply_json(response, r);
+    }
+    if (strncmp(src, "xiaomi://", 9) != 0 && strncmp(src, "rtsp://", 7) != 0) {
+        cJSON_AddStringToObject(r, "error", "仅支持 xiaomi:// 或 rtsp:// 源");
+        return reply_json(response, r);
+    }
+
+    /* 落盘：更新配置文件中该 tile 的 source（重启后仍生效） */
+    {
+        FILE *fp = fopen(g_config_path, "rb");
+        char buf[32768];
+        size_t n = fp ? fread(buf, 1, sizeof(buf) - 1, fp) : 0;
+        if (fp) fclose(fp);
+        buf[n] = 0;
+        cJSON *doc = cJSON_Parse(buf);
+        cJSON *cams = doc ? cJSON_GetObjectItem(doc, "cameras") : NULL;
+        cJSON *it;
+        bool found = false;
+        cJSON_ArrayForEach(it, cams) {
+            cJSON *t = cJSON_GetObjectItem(it, "tile");
+            if (cJSON_IsNumber(t) && t->valueint == tile) {
+                cJSON *s = cJSON_GetObjectItem(it, "source");
+                if (cJSON_IsString(s)) cJSON_SetValuestring(s, src);
+                else cJSON_AddStringToObject(it, "source", src);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            cJSON_Delete(doc);
+            cJSON_AddStringToObject(r, "error", "配置中未找到该 tile");
+            return reply_json(response, r);
+        }
+        char *out = cJSON_Print(doc);
+        cJSON_Delete(doc);
+        if (!out) {
+            cJSON_AddStringToObject(r, "error", "配置序列化失败");
+            return reply_json(response, r);
+        }
+        size_t len = strlen(out);
+        out[len] = '\n';
+        int wrc = write_file_atomic(g_config_path, out, len + 1);
+        free(out);
+        if (wrc != 0) {
+            cJSON_AddStringToObject(r, "error", "配置写入失败");
+            return reply_json(response, r);
+        }
+    }
+
+    pthread_mutex_lock(&g_src_lock);
+    g_src_tile = tile;
+    snprintf(g_src_url, sizeof(g_src_url), "%s", src);
+    g_src_pending = true;
+    pthread_mutex_unlock(&g_src_lock);
+    return reply_json(response, r);
+}
+
+static int handle_preview_full(cJSON *params, ainice_bridge_response_t *response)
+{
+    int tile = 0;
+    cJSON *j = cJSON_GetObjectItem(params, "cam");
+    if (cJSON_IsNumber(j)) tile = j->valueint;
+    else if (cJSON_IsString(j) && j->valuestring[0]) tile = atoi(j->valuestring);
+
+    capture_t *cap = NULL;
+    pthread_mutex_lock(&g_caps_lock);
+    if (tile >= 0 && tile < MULTICAM_MAX_TILES && g_caps && g_cap_by_tile[tile] >= 0)
+        cap = &g_caps[g_cap_by_tile[tile]];
+    pthread_mutex_unlock(&g_caps_lock);
+
+    snap_cache_t *c = &g_snap_cache[tile >= 0 && tile < MULTICAM_MAX_TILES ? tile : 0];
+    int64_t now = now_ms();
+    if (cap && c->buf && c->len && now - c->ms < 150) {
+        cJSON *r = resp_ok();
+        char *b64 = malloc((c->len + 2) / 3 * 4 + 1);
+        if (!b64) { cJSON_AddStringToObject(r, "error", "oom"); return reply_json(response, r); }
+        b64_encode(c->buf, c->len, b64);
+        cJSON_AddStringToObject(r, "jpeg", b64);
+        cJSON_AddNumberToObject(r, "ts", c->ms);
+        free(b64);
+        return reply_json(response, r);
+    }
+    if (!cap) {
+        cJSON *r = resp_ok();
+        cJSON_AddStringToObject(r, "error", "捕获未就绪（插件启动中或该路未启用）");
+        return reply_json(response, r);
+    }
+    if (!c->buf) {
+        c->buf = malloc(SNAP_BUF_CAP);
+        if (!c->buf) {
+            cJSON *r = resp_ok();
+            cJSON_AddStringToObject(r, "error", "oom");
+            return reply_json(response, r);
+        }
+    }
+    int n = capture_snapshot_jpeg(cap, c->buf, SNAP_BUF_CAP);
+    if (n < 0) {
+        cJSON *r = resp_ok();
+        cJSON_AddStringToObject(r, "error", n == -2 ? "JPEG 过大（缓冲不足）" : "无可用帧");
+        return reply_json(response, r);
+    }
+    c->len = (size_t)n;
+    c->ms = now;
+    cJSON *r = resp_ok();
+    char *b64 = malloc(((size_t)n + 2) / 3 * 4 + 1);
+    if (!b64) { cJSON_AddStringToObject(r, "error", "oom"); return reply_json(response, r); }
+    b64_encode(c->buf, c->len, b64);
+    cJSON_AddStringToObject(r, "jpeg", b64);
+    cJSON_AddNumberToObject(r, "ts", c->ms);
+    free(b64);
+    return reply_json(response, r);
+}
+
 static int handle_cameras_list(const char *data_dir, const char *mh_yaml,
                                const char *g2r_bin, ainice_bridge_response_t *response)
 {
@@ -356,6 +551,10 @@ static int bridge_handler(const char *request_json, ainice_bridge_response_t *re
     } else if (!strcmp(method, "reload")) {
         *g_reload_flag = 1;
         rc = reply_json(response, resp_ok());
+    } else if (!strcmp(method, "source.set")) {
+        rc = handle_source_set(params, response);
+    } else if (!strcmp(method, "preview.full")) {
+        rc = handle_preview_full(params, response);
     } else if (!strcmp(method, "auth.session")) {
         rc = bridge_auth_session(params, response);
     } else if (!strcmp(method, "auth.status")) {

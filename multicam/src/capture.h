@@ -41,6 +41,10 @@ typedef struct {
     volatile int keyint_ms;       /* 实测 GOP 间隔毫秒，0=未知 */
     uint64_t skipped_pkts;        /* 窗口外被跳过的包数 */
     int64_t last_key_ms;          /* 上一个关键帧到达时刻（仅捕获线程访问） */
+    /* 取景器 MJPEG 快照（仅 panel bridge 线程访问；void* 避免头文件引 ffmpeg） */
+    void *snap_enc;               /* AVCodecContext*（懒初始化常驻） */
+    void *snap_frm;               /* AVFrame*（编码输入帧，尺寸按槽位锁定值） */
+    int64_t snap_pts;             /* 快照帧序号 */
 } capture_t;
 
 int capture_start(capture_t *cap, const char *url);
@@ -71,5 +75,10 @@ int64_t capture_paint_crop(capture_t *cap, uint8_t *dst_y, uint8_t *dst_u, uint8
                            int dst_y_stride, int dst_c_stride,
                            int crop_x, int crop_y,
                            int crop_w, int crop_h);
+
+/* 取景器快照：把当前槽位全幅帧编码成一帧 JPEG（面板拖动取景框用）。
+   编码器懒初始化常驻（每路一个，仅 bridge 线程串行调用）。
+   返回 JPEG 字节数；无帧 -1；输出缓冲不足 -2。 */
+int capture_snapshot_jpeg(capture_t *cap, uint8_t *buf, size_t buf_cap);
 
 #endif

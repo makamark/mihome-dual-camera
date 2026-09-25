@@ -9,7 +9,6 @@ const state = {
   cfg: null,          // config.get 的完整文档（可编辑副本）
   devices: [],        // [{id,name,model,localip}]
   status: null,
-  mapping: null,      // {prefix, events:[{key,present,absent}]}
   dirty: false,
 };
 
@@ -68,32 +67,89 @@ function nSlots() {
   return m;
 }
 
-/* ---------- 渲染：状态 ---------- */
+/* ---------- 渲染：状态（只给用户关心的：每路是否正常 + 运行时长） ---------- */
+function camLabel(slot) {
+  const c = (state.cfg && state.cfg.cameras || []).find(c => (c.tile || 0) === slot);
+  if (!c) return "摄像头 " + (slot + 1);
+  if (c.name) return c.name;
+  const did = camDid(c);
+  const dev = (state.devices || []).find(d => String(d.id) === did);
+  return dev ? dev.name : (c.id || "摄像头 " + (slot + 1));
+}
 function renderStatus() {
   const s = state.status;
   if (!s || !s.valid) { $("state-badge").textContent = "未就绪"; $("state-badge").className = "state warn"; return; }
   canvasResize();
   const bad = (s.tiles || []).some(t => t.enabled && t.gray);
   const badge = $("state-badge");
-  badge.textContent = s.pushing ? (bad ? "运行中（部分画面置灰）" : "运行中") : "连接管线中…";
+  badge.textContent = s.pushing ? (bad ? "部分画面离线" : "运行中") : "连接中";
   badge.className = "state " + (s.pushing ? (bad ? "warn" : "ok") : "warn");
 
-  const fmt = (n) => n == null ? "—" : n;
-  $("status-grid").innerHTML = `
-    <div class="stat"><div class="k">画布</div><div class="v">${fmt(s.canvas_w)}×${fmt(s.canvas_h)}</div></div>
-    <div class="stat"><div class="k">帧率</div><div class="v">${fmt(s.fps)} fps</div></div>
-    <div class="stat"><div class="k">已推帧</div><div class="v">${fmt(s.frames)}</div></div>
-    ${s.rss_kb ? `<div class="stat"><div class="k">插件内存</div><div class="v">${Math.round(s.rss_kb / 1024)} MB</div></div>` : ""}
-    <div class="stat"><div class="k">运行时长</div><div class="v">${Math.floor(fmt(s.uptime_s) / 60)} 分钟</div></div>
-    <div class="tiles-row">${ (s.tiles || []).map(t => `
-      <div class="tilechip">
-        <span class="dot ${t.enabled ? (t.gray ? "gray" : "live") : ""}"></span>
-        <div><b>Tile ${t.slot}</b> · ${t.cam_id || "—"}<br>
-        <small title="${t.gray ? (t.note || "置灰") : `帧龄 ${t.age_ms}ms · 解 ${fmt(t.decoded)}${t.keyint_ms ? ` · GOP ${t.keyint_ms}ms` : ""}`}${t.g2r_port ? ` · g2rtc:${t.g2r_port}${t.g2r_alive ? (t.g2r_rss_kb ? `(${Math.round(t.g2r_rss_kb / 1024)}MB)` : "†") : "†"}` : ""}">${t.gray ? (t.note || "置灰") : `帧龄 ${t.age_ms}ms · 解 ${fmt(t.decoded)}${t.keyint_ms ? ` · GOP ${t.keyint_ms}ms` : ""}`}${t.g2r_port ? ` · g2rtc:${t.g2r_port}${t.g2r_alive ? (t.g2r_rss_kb ? `(${Math.round(t.g2r_rss_kb / 1024)}MB)` : "†") : "†"}` : ""}</small></div>
-      </div>`).join("") }</div>`;
+  const up = s.uptime_s || 0;
+  const d = Math.floor(up / 86400), h = Math.floor(up % 86400 / 3600), m = Math.floor(up % 3600 / 60);
+  const line = $("uptime-line");
+  if (line) line.textContent = up > 60 ? `已连续运行 ${d ? d + " 天 " : ""}${h ? h + " 小时 " : ""}${m} 分钟` : "正在启动…";
+  const row = $("tiles-row");
+  if (row) row.innerHTML = (s.tiles || []).map(t => {
+    const live = t.enabled && !t.gray;
+    const tip = live
+      ? "画面正常"
+      : (t.note || "等待画面");
+    return `<div class="tilechip" title="${tip}">
+      <span class="dot ${t.enabled ? (t.gray ? "gray" : "live") : ""}"></span>
+      <div><b>${camLabel(t.slot)}</b><small>${t.gray ? (t.note || "等待画面") : "画面正常"}</small></div>
+    </div>`;
+  }).join("");
 }
 
 /* ---------- 渲染：摄像头 ---------- */
+/* 取景器状态（每 tile 一份）：img=最新原画快照、x=框位置、busy 防重入。
+   renderCameras 重跑（选机/刷新目录）时保留 img，画面不闪。 */
+const framers = {};
+function drawFramer(tile) {
+  const f = framers[tile];
+  if (!f || !f.ctx) return;
+  const cx = f.ctx, W = 848, H = 480, BW = 400;
+  if (f.img) cx.drawImage(f.img, 0, 0, W, H);
+  else {
+    cx.fillStyle = "#101214"; cx.fillRect(0, 0, W, H);
+    cx.fillStyle = "#7a828c"; cx.font = "14px sans-serif";
+    cx.fillText("取景画面加载中…", 12, 24);
+  }
+  const x = f.x;
+  cx.fillStyle = "rgba(0, 0, 0, 0.55)";
+  cx.fillRect(0, 0, x, H);
+  cx.fillRect(x + BW, 0, W - x - BW, H);
+  cx.strokeStyle = "#4ca7ff";
+  cx.lineWidth = 3;
+  cx.strokeRect(x + 1.5, 1.5, BW - 3, H - 3);
+  cx.fillStyle = "rgba(76, 167, 255, 0.95)";
+  cx.font = "16px sans-serif";
+  cx.fillText(`画框 ${x}`, x + 10, 30);
+}
+async function refreshFramer(tile) {
+  const f = framers[tile];
+  if (!f || f.busy) return;
+  f.busy = true;
+  try {
+    /* cam 必须是数字：for...in 遍历键是字符串，后端只认数值 tile */
+    const r = await call("multicam", "preview.full", { cam: Number(tile) }, 8000);
+    if (!r.jpeg) throw new Error(r.error || "no jpeg");
+    const img = new Image();
+    await new Promise((res, rej) => {
+      img.onload = res; img.onerror = rej;
+      img.src = "data:image/jpeg;base64," + r.jpeg;
+    });
+    f.img = img;
+    drawFramer(tile);
+  } catch (e) { /* 静默：下轮/下次操作重试 */ }
+  f.busy = false;
+}
+setInterval(() => {
+  if (document.visibilityState !== "visible") return;
+  for (const t in framers) refreshFramer(t);
+}, 2500);
+
 function renderCameras() {
   const acct = accountFromCfg();
   const wrap = $("cam-list");
@@ -102,23 +158,29 @@ function renderCameras() {
     const card = document.createElement("div");
     card.className = "cam-card";
     const did = camDid(cam);
-    const opts = ['<option value="__manual__">手动源…</option>']
-      .concat(state.devices.map(d =>
-        `<option value="${d.id}" ${String(d.id) === did ? "selected" : ""}>${d.name || d.id}（${d.model || "?"} @ ${devIp(d) || "?"}）</option>`).join(""));
+    const opts = state.devices.map(d =>
+      `<option value="${d.id}" ${String(d.id) === did ? "selected" : ""}>${d.name || d.id}</option>`).join("");
     const cropX = cam.crop_x != null && cam.crop_x >= 0 ? cam.crop_x : 224;
     cam.crop_x = cropX;
 
     card.innerHTML = `
       <div class="cam-row">
         <input type="checkbox" class="cam-en" ${cam.enabled !== false ? "checked" : ""} title="启用">
-        <span class="tile-label">Tile ${cam.tile ?? i}</span>
+        <span class="tile-label">第 ${(cam.tile ?? i) + 1} 路</span>
         <select class="dev">${opts}</select>
         <input class="src" type="text" placeholder="xiaomi:// 或 rtsp:// 源" value="${cam.source || ""}">
       </div>
+      <div class="framer">
+        <canvas class="framer-cv" width="848" height="480"></canvas>
+        <div class="framer-bar">
+          <span class="hint">左右拖动蓝框选取画面，保存后生效</span>
+          <button type="button" class="btn micro framer-rl">刷新画面</button>
+        </div>
+      </div>
       <div class="crop-control">
         <div class="crop-header">
-          <span>水平画框取景 (400×480)</span>
-          <span class="crop-val">X: ${cropX} (${cropX === 0 ? "靠左" : cropX === 448 ? "靠右" : cropX === 224 ? "居中" : "自定义"})</span>
+          <span>取景位置</span>
+          <span class="crop-val">${cropX === 0 ? "靠左" : cropX === 448 ? "靠右" : cropX === 224 ? "居中" : "自定义"}</span>
           <div class="crop-presets">
             <button type="button" class="btn micro" data-x="0">靠左</button>
             <button type="button" class="btn micro" data-x="224">居中</button>
@@ -126,38 +188,75 @@ function renderCameras() {
           </div>
         </div>
         <input type="range" class="crop-slider" min="0" max="448" step="2" value="${cropX}">
-        <div class="crop-track-vis" title="取景范围占全画面 (400 / 848)">
-          <div class="crop-window-indicator" style="left: ${(cropX / 848 * 100).toFixed(1)}%; width: ${(400 / 848 * 100).toFixed(1)}%;"></div>
-        </div>
       </div>`;
     card.querySelector(".cam-en").onchange = e => { cam.enabled = e.target.checked; markDirty(); };
+    /* 换源自动生效：调 source.set（后端落盘+就地重建该路，不重启进程），无需保存 */
+    async function applySource(tile, src, label) {
+      const name = `第 ${tile + 1} 路`;
+      $("save-msg").textContent = `${name}正在切换${label ? "到「" + label + "」" : ""}…`;
+      try {
+        await call("multicam", "source.set", { tile, source: src }, 10000);
+        $("save-msg").textContent = `${name}已切换，画面刷新中…`;
+        setTimeout(() => refreshFramer(tile), 4000);
+      } catch (e) {
+        $("save-msg").textContent = `${name}切换失败：${e.message}`;
+      }
+    }
     card.querySelector(".dev").onchange = e => {
       if (e.target.value === "__manual__") return;
       const dev = state.devices.find(d => String(d.id) === e.target.value);
-      if (dev) {
-        cam.source = sourceFor(dev, acct);
-        cam.did = String(dev.id); cam.name = dev.name; cam.model = dev.model; cam.localip = dev.localip;
-        card.querySelector(".src").value = cam.source;
-        markDirty();
-      }
+      if (!dev) return;
+      cam.source = sourceFor(dev, acct);
+      cam.did = String(dev.id); cam.name = dev.name; cam.model = dev.model; cam.localip = dev.localip;
+      card.querySelector(".src").value = cam.source;
+      applySource(cam.tile, cam.source, dev.name || dev.id);
     };
-    card.querySelector(".src").onchange = e => { cam.source = e.target.value.trim(); markDirty(); };
+    card.querySelector(".src").onchange = e => {
+      cam.source = e.target.value.trim();
+      if (cam.source) applySource(cam.tile, cam.source, "手动源");
+    };
 
     const slider = card.querySelector(".crop-slider");
     const valLabel = card.querySelector(".crop-val");
-    const indicator = card.querySelector(".crop-window-indicator");
+    const framer = framers[cam.tile] = framers[cam.tile] || { img: null, busy: false, x: cropX };
+    framer.canvas = card.querySelector(".framer-cv");
+    framer.ctx = framer.canvas.getContext("2d");
+    framer.x = cropX;
     function updateCrop(x) {
       x = Math.max(0, Math.min(448, parseInt(x, 10) & ~1));
       cam.crop_x = x;
       slider.value = x;
-      valLabel.textContent = `X: ${x} (${x === 0 ? "靠左" : x === 448 ? "靠右" : x === 224 ? "居中" : "自定义"})`;
-      indicator.style.left = `${(x / 848 * 100).toFixed(1)}%`;
+      valLabel.textContent = x === 0 ? "靠左" : x === 448 ? "靠右" : x === 224 ? "居中" : "自定义";
+      framer.x = x;
+      drawFramer(cam.tile);
       markDirty();
+      $("save-msg").textContent = "取景已调整，点「保存并应用」后生效";
     }
     slider.oninput = e => updateCrop(e.target.value);
     card.querySelectorAll(".crop-presets button").forEach(btn => {
       btn.onclick = () => updateCrop(btn.dataset.x);
     });
+
+    /* 取景框拖动：指针位置=框中心；拖动纯前端画框（零延迟），松手后拉新帧 */
+    {
+      const cv = framer.canvas;
+      let dragging = false;
+      const dragTo = e => {
+        const r = cv.getBoundingClientRect();
+        const px = (e.clientX - r.left) * (848 / r.width);
+        updateCrop(Math.round(px) - 200);
+      };
+      cv.onpointerdown = e => { dragging = true; cv.setPointerCapture(e.pointerId); dragTo(e); };
+      cv.onpointermove = e => { if (dragging) dragTo(e); };
+      cv.onpointerup = () => {
+        if (!dragging) return;
+        dragging = false;
+        setTimeout(() => refreshFramer(cam.tile), 600);
+      };
+      cv.onpointercancel = () => { dragging = false; };
+    }
+    card.querySelector(".framer-rl").onclick = () => refreshFramer(cam.tile);
+    refreshFramer(cam.tile);
     wrap.appendChild(card);
   });
 }
@@ -182,45 +281,45 @@ async function refreshDeviceZones() {
     deviceZones = { revision: prof.revision, zones };
     const info = $("zone-info");
     if (info) info.textContent = zones.length
-      ? `设备检测区域 revision ${prof.revision}：${zones.map(z => `${z.id} ${z.name || "未命名"}`).join("、")}（在总览界面修改）`
-      : "设备尚未配置检测区域（在总览界面的总览画面上绘制）";
+      ? `检测区域：${zones.map(z => `${z.id} ${z.name || "未命名"}`).join("、")}（在设备总览界面修改）`
+      : "暂无检测区域，可在设备总览界面绘制";
   } catch (e) {
-    const info = $("zone-info");
-    if (info && !deviceZones) info.textContent = "检测区域读取失败（/api/zones）";
+    /* 读取失败不打扰：下轮自动重试 */
   }
 }
 
 /* ---------- 画布预览 + 区域叠加 ---------- */
 const canvas = $("pv-canvas"), ctx = canvas.getContext("2d");
-/* 预览懒加载：MJPEG 拉流会让主应用持续 JPEG 编码（约 5–15% CPU），
-   默认关闭；闲置 60s 自动断开。 */
-let previewOn = false, pvTimer = 0;
+/* 预览常开：面板打开即拉流、不自动关闭（旧版 60s 闲置定时器是一次性的，
+   到点必掐断，导致框选画面无法常显）。拉流期间主应用持续 JPEG 编码
+   （约 5–15% CPU），关闭面板或点「关闭预览」即停；插件重启/断流 3s 自动重连。 */
+let previewOn = false, pvRetryTimer = 0;
 function previewStart() {
   if (previewOn) return;
   previewOn = true;
   $("pv-src").src = "/mjpeg/stream";
   $("pv-toggle").textContent = "关闭预览";
-  $("pv-hint").textContent = "预览已开启（闲置自动关闭）";
-  pvKeep();
 }
 function previewStop() {
   if (!previewOn) return;
   previewOn = false;
   $("pv-src").removeAttribute("src");
   $("pv-toggle").textContent = "开启预览";
-  $("pv-hint").textContent = "预览已关闭";
-  clearTimeout(pvTimer);
+  clearTimeout(pvRetryTimer);
 }
-function pvKeep() {
+$("pv-src").onerror = () => {
   if (!previewOn) return;
-  clearTimeout(pvTimer);
-  pvTimer = setTimeout(() => previewStop(), 60000);
-}
+  clearTimeout(pvRetryTimer);
+  pvRetryTimer = setTimeout(() => { if (previewOn) $("pv-src").src = "/mjpeg/stream"; }, 3000);
+};
 $("pv-toggle").onclick = () => (previewOn ? previewStop() : previewStart());
 function canvasResize() {
   if (!state.status) return;
-  canvas.width = state.status.canvas_w || 800;
-  canvas.height = state.status.canvas_h || 480;
+  const w = state.status.canvas_w || 800, h = state.status.canvas_h || 480;
+  /* 同尺寸重复赋值也会清空画布（状态 3s 轮询一次 → 预览每 3s 闪一次的根因） */
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w;
+  canvas.height = h;
 }
 function drawOverlay() {
   const img = $("pv-src");
@@ -231,10 +330,14 @@ function drawOverlay() {
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.fillStyle = "#7a828c";
     ctx.font = "14px sans-serif";
-    ctx.fillText("预览未开启（检测区域仍显示）", 12, 24);
+    ctx.fillText(previewOn ? "预览连接中…" : "预览已关闭（检测区域仍显示）", 12, 24);
   }
-  /* crop_1x2 模式下绘制左右路中分线与标识 */
+  /* crop_1x2 模式：常显左右路分界与每路框选状态 */
   if (canvas.width === 800 && canvas.height === 480) {
+    const tiles = (state.status && state.status.tiles) || [];
+    const lab = (t, fb) => t
+      ? `${camLabel(t.slot)} · 画框 ${t.crop_x != null ? t.crop_x : "?"}${t.gray ? " · 离线" : ""}`
+      : fb;
     ctx.save();
     ctx.strokeStyle = "rgba(255, 255, 255, 0.25)";
     ctx.setLineDash([4, 4]);
@@ -243,9 +346,9 @@ function drawOverlay() {
     ctx.lineTo(400, 480);
     ctx.stroke();
     ctx.font = "12px sans-serif";
-    ctx.fillStyle = "rgba(255, 255, 255, 0.4)";
-    ctx.fillText("Tile 0 · 左路 (400×480)", 8, 18);
-    ctx.fillText("Tile 1 · 右路 (400×480)", 408, 18);
+    ctx.fillStyle = "rgba(255, 255, 255, 0.55)";
+    ctx.fillText(lab(tiles[0], "左路"), 8, 18);
+    ctx.fillText(lab(tiles[1], "右路"), 408, 18);
     ctx.restore();
   }
   if (!deviceZones) return;
@@ -272,55 +375,6 @@ function drawOverlay() {
 setInterval(() => { try { drawOverlay(); } catch (e) {} }, 500);
 setInterval(() => { refreshDeviceZones(); }, 30000);
 
-/* ---------- 渲染：米家映射 ---------- */
-function renderMapping() {
-  const m = state.mapping;
-  const tb = $("mapping-table").querySelector("tbody");
-  if (!m || !m.events) { tb.innerHTML = '<tr><td colspan="3">读取失败（米家网关插件未启用？）</td></tr>'; return; }
-  const keys = ["global", ..."ABCDEFGH".split("").map(c => "Zone-" + c)];
-  tb.innerHTML = keys.map(k => {
-    const e = m.events.find(x => x.key === k) || { key: k, present: "", absent: "" };
-    return `<tr><td>${k}</td>
-      <td><input data-k="${k}" data-f="present" value="${e.present || ""}" placeholder="有人事件名"></td>
-      <td><input data-k="${k}" data-f="absent" value="${e.absent || ""}" placeholder="无人事件名"></td></tr>`;
-  }).join("");
-  tb.querySelectorAll("input").forEach(inp => inp.onchange = () => {
-    const e = state.mapping.events.find(x => x.key === inp.dataset.k);
-    if (e) { e[inp.dataset.f] = inp.value.trim(); }
-  });
-}
-/* migateway /gateway/virtual-events 保存契约（virtual_events_save 校验）：
-   body 恰好 {prefix, events} 两个键；events 恰好 9 槽（global + Zone-A..H），
-   每项恰好 {key, present, absent} 三个键且 present/absent 去空白后非空。
-   GET 返回的 {prefix, events, status} 与清空的输入都不能直接回传。 */
-const MAPPING_KEYS = ["global", ..."ABCDEFGH".split("").map(c => "Zone-" + c)];
-const MAPPING_DEFAULTS = {
-  "global": ["全局有人", "全局无人"], "Zone-A": ["A区有人", "A区无人"],
-  "Zone-B": ["B区有人", "B区无人"], "Zone-C": ["C区有人", "C区无人"],
-  "Zone-D": ["D区有人", "D区无人"], "Zone-E": ["E区有人", "E区无人"],
-  "Zone-F": ["F区有人", "F区无人"], "Zone-G": ["G区有人", "G区无人"],
-  "Zone-H": ["H区有人", "H区无人"],
-};
-$("mapping-save").onclick = async () => {
-  try {
-    const m = state.mapping || { prefix: "", events: [] };
-    const events = MAPPING_KEYS.map(k => {
-      const e = (m.events || []).find(x => x.key === k) || {};
-      return {
-        key: k,
-        present: (e.present || "").trim() || MAPPING_DEFAULTS[k][0],
-        absent: (e.absent || "").trim() || MAPPING_DEFAULTS[k][1],
-      };
-    });
-    const prefix = (m.prefix || "").trim();
-    await call("migateway", "route",
-      { path: "/gateway/virtual-events", http_method: "POST", body: { prefix, events } }, 8000);
-    state.mapping = { prefix, events };
-    renderMapping();
-    flash("米家映射已保存");
-  } catch (e) { flash("米家映射保存失败：" + e.message); }
-};
-
 /* ---------- 拉取 ---------- */
 async function withRetry(fn, times = 8, gap = 2500) {
   for (let i = 0; ; i++) {
@@ -332,7 +386,7 @@ async function loadAll() {
   try {
     const r = await withRetry(() => call("multicam", "config.get"));
     state.cfg = r.config;
-    document.title = "多摄像头拼图 · 设置";
+    document.title = "米家双路摄像头";
     delete state.cfg.areas;      /* 已废弃：检测区域由设备侧 zone profile 管理 */
     delete state.cfg.zones;
     if (!state.cfg.cameras) state.cfg.cameras = [];
@@ -340,16 +394,12 @@ async function loadAll() {
     renderCameras();
     refreshDeviceZones();
     notifyReady();   /* 配置就绪即完成启动握手；状态/映射继续后台轮询 */
-    refreshAuth();   /* 授权状态轻量；设备目录不自动加载（157MB 设备防 fork 风暴），点按钮手动拉 */
+    refreshAuth();   /* 授权状态轻量；设备目录打开面板自动加载（后台静默，失败不打扰） */
+    refreshDevices(true);
   } catch (e) {
     flash("读取配置失败：" + e.message);
     setUiState("error", "配置读取失败");
   }
-  try {
-    const r = await withRetry(() => call("migateway", "route", { path: "/gateway/virtual-events", http_method: "GET" }, 6000), 3);
-    state.mapping = r.virtual_events || r;
-    renderMapping();
-  } catch (e) { state.mapping = null; renderMapping(); }
   try { await refreshStatus(); } catch (e) {}
 }
 
@@ -387,6 +437,10 @@ function authErrText(m) {
 }
 
 /* ---------- 账号授权（原生：multicam 内置 xiaomi-phone 客户端，无需 mhcamera） ---------- */
+function authSummary(text, cls) {
+  const el = $("auth-summary-state");
+  if (el) { el.textContent = text; el.className = "state " + (cls || ""); }
+}
 let authRetryTimer = 0;
 async function refreshAuth(retry) {
   clearTimeout(authRetryTimer);
@@ -395,17 +449,19 @@ async function refreshAuth(retry) {
   try { st = (await call("multicam", "auth.status", {}, 8000)).auth; }
   catch (e) {
     /* 清除/应用配置会触发插件 reload（bridge 窗口期不可用）：自动重试直到恢复 */
+    authSummary("重启中", "warn");
     el.innerHTML = '<p class="hint">插件重启中，授权服务稍候自动恢复…</p>';
     if (retry !== -1)
       authRetryTimer = setTimeout(() => refreshAuth((retry || 0) + 1), 3000);
     return;
   }
   if (st && st.state_text === "authenticated") {
+    authSummary("已授权", "ok");
     el.innerHTML = `
       <div class="auth-ok">
         <span class="mi-badge">MI</span>
-        <div><div class="k">当前授权账号</div><b>已授权（token 由本插件自持）</b></div>
-        <button class="btn danger" id="auth-clear">清除授权</button>
+        <div><b>已授权</b></div>
+        <button class="btn danger small" id="auth-clear">清除授权</button>
       </div>`;
     $("auth-clear").onclick = async () => {
       if (!confirm("清除后将删除账号授权，所有摄像头停止，需重新短信验证。确定？")) return;
@@ -417,15 +473,16 @@ async function refreshAuth(retry) {
     };
     return;
   }
+  authSummary("未授权", "warn");
   el.innerHTML = `
-    <p class="hint">输入米家手机号，获取短信验证码完成授权（内置授权服务，自动按需启动）。验证成功后所有摄像头自动可用。</p>
+    <p class="hint">输入米家手机号，完成短信验证后摄像头自动可用。</p>
     <div class="auth-form">
       <select id="auth-cc"><option>+86</option><option>+852</option><option>+853</option><option>+886</option><option>+65</option></select>
-      <input id="auth-phone" type="tel" placeholder="手机号" maxlength="15">
+      <input id="auth-phone" type="tel" placeholder="手机号" maxlength="15" aria-label="手机号">
       <button class="btn primary" id="auth-send">发送验证码</button>
     </div>
     <div class="auth-form" id="auth-verify-row" style="display:none">
-      <input id="auth-code" type="text" placeholder="6 位验证码" maxlength="8">
+      <input id="auth-code" type="text" placeholder="6 位验证码" maxlength="8" aria-label="验证码">
       <button class="btn primary" id="auth-verify">验证并授权</button>
       <button class="btn" id="auth-resend">重新发送</button>
       <button class="btn" id="auth-cancel">取消</button>
@@ -508,7 +565,16 @@ $("cam-add").onclick = () => {
 /* 区域编辑已移除：检测区域在设备总览界面管理，面板只读叠加 */
 
 /* ---------- 保存 ---------- */
-function markDirty() { state.dirty = true; }
+function markDirty() {
+  state.dirty = true;
+  const b = $("save");
+  if (b) b.classList.add("attention");
+}
+function markClean() {
+  state.dirty = false;
+  const b = $("save");
+  if (b) b.classList.remove("attention");
+}
 function flash(msg) { $("save-msg").textContent = msg; setTimeout(() => { if ($("save-msg").textContent === msg) $("save-msg").textContent = ""; }, 5000); }
 
 $("fps").onchange = e => { state.cfg.output = state.cfg.output || {}; state.cfg.output.fps = +e.target.value; markDirty(); };
@@ -519,8 +585,8 @@ $("save").onclick = async () => {
   try {
     const r = await call("multicam", "config.set", { config: state.cfg }, 8000);
     if (r.error) throw new Error(r.error);
-    flash("已保存，插件重启中…");
-    state.dirty = false;
+    flash("已保存，正在应用…");
+    markClean();
     /* 等 bridge 随进程 exec 短暂中断后恢复 */
     let ok = false;
     for (let i = 0; i < 30 && !ok; i++) {
@@ -528,6 +594,9 @@ $("save").onclick = async () => {
       try { await refreshStatus(); ok = !!(state.status && state.status.valid); } catch (e) {}
     }
     flash(ok ? "已应用新配置" : "应用超时，请刷新页面查看状态");
+    /* 插件 exec 重启会掐断 /mjpeg/stream，浏览器 <img> 会冻结在最后一帧
+       （不会自动重连）——保存应用后强制重开预览，否则画面看起来"无变化" */
+    if (ok && previewOn) { previewStop(); previewStart(); }
   } catch (e) { flash("保存失败：" + e.message); }
   b.disabled = false;
 };
@@ -541,4 +610,7 @@ fetch("/api/plugins").then(r => r.json()).then(d => {
   if (p) $("ver").textContent = "v" + p.version;
 }).catch(() => {});
 
+/* 预览常开：面板打开即拉流（不再默认关闭/闲置掐断），状态就绪前按 800×480 画布 */
+canvas.width = 800; canvas.height = 480;
+previewStart();
 loadAll().then(() => { postHeight(); });
