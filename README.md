@@ -54,11 +54,12 @@ docker run --rm -v "$(pwd)":/work ainice-build make -C multicam package
 multicam/     插件 C 源码、Web 设置面板、打包配置
 release/      release.json（版本号与更新日志）
 build-env/    交叉编译 Dockerfile
-docs/         设计文档
 tools/        设备部署辅助脚本
 ```
 
 ## 致谢与许可
+
+本项目以 [MIT](LICENSE) 许可发布。
 
 - [go2rtc](https://github.com/AlexxIT/go2rtc)（MIT）— 流媒体核心
 - [mhcamera](https://github.com/wade-hello/mhcamera)（MIT）— 米家授权实现（`src/vendor/xiaomi_api_client`）
