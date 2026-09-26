@@ -1,21 +1,28 @@
 # multicam 插件
 
-多路小米摄像头拼图画布接入（设计见 `../docs/multicam-plugin-design.md`）。
+米家双路摄像头的插件源码、Web 设置面板与打包配置。安装、使用与功能说明见[仓库根 README](../README.md)。
 
-**v0.5.0（2026-09-20）左右并排画框取景（crop_1x2，已上机实测）**：
-- **左右并排画框取景**：两路摄像头按所选画框各裁切 400×480，左右并排拼成 800×480 画布。
-  - **比例严格 5:3（1.6667）**：与 NPU 模型视窗 640×384（5:3）完全等比，**全图零 Letterbox 盲区、零拉伸变形、零时延**。
-  - **垂直 100% 全高**：每路 480px 高度完整保留，从头到脚都能看全；
-  - **水平画框取景**：在每路原画（848 宽）中滑动取景框（0..448，步长 2），支持靠左 (0) / 居中 (224) / 靠右 (448) 快速预设。
-- **所见即所得区域绘制**：合成的 800×480 画面送入设备主系统，直接在设备官方**「总览」界面绘制 Zone-A..H 检测区域**（左半边画 A 路，右半边画 B 路）。
-- **GOMAXPROCS=1 + 进程收割加固**：go2rtc 子进程限定单线程调度，清理僵尸进程，彻底杜绝系统线程配额超限导致的 `errno=11` 崩溃循环。
-- **二进制零拷贝**：原版端口 8554 及 Auth 实例直接运行插件目录二进制，避免在 32MB /data 分区重复写入 8.3MB 大文件。
+## 打包
 
-**v0.4.0（2026-09-19）架构简化：单一事实源 + 摆脱 mhcamera**：
-- 检测区域单一事实源：删除插件配置 areas/zones 与 zones.save 下发链路；区域在设备总览界面绘制，面板只读叠加。
-- 原生短信授权：1:1 复刻 mhcamera 开源实现（vendor/xiaomi_api_client，MIT），无需安装 mhcamera 插件，内置 xiaomi-phone 客户端。
-- token 自持链：自身实例 yaml（运行中自续）→ 授权快照 → mh yaml 回退。
+```bash
+docker run --rm -v "$(pwd)":/work ainice-build make -C multicam package
+```
 
-**v0.3.5–0.3.7（2026-09-19）性能优化**：
-- GOP 窗口解码：每 GOP 连解 4 帧，其余 AVDISCARD_NONKEY 跳过，整机 CPU 降至 20–35%。
-- 预览懒加载：/mjpeg/stream 默认断开，闲置 60 秒自动关闭，省去持续 JPEG 编码负载。
+产物为 `multicam-<版本>.plugin`（tar.gz 结构：`plugin.json` + `multicam.app` 入口 + `bin/` go2rtc + `libs/` FFmpeg 运行库 + `etc/` 默认配置 + `www/` 面板）。
+
+## 源码结构
+
+```
+src/main.c     启动、拉流循环、置灰与自愈
+src/config.c   配置加载与首次启动引导
+src/g2r.c      go2rtc 实例生命周期、凭证与 token 自持
+src/capture.c  RTSP 拉流与 HEVC/H264/MJPEG 软解（GOP 窗口解码）
+src/compose.c  画布合成（左右并排裁切 / 网格）
+src/push.c     SDK bitstream 推流
+src/auth.c     米家账号授权编排
+src/panel.c    面板 bridge（状态/配置/取景器快照/换源/授权）
+src/vendor/    cJSON 与米家授权客户端（mhcamera，MIT）
+www/           设置面板（原生 HTML/CSS/JS，无构建）
+```
+
+版本号在 `Makefile` 与 `plugin.json` 中维护，更新日志见 `release/release.json`。
