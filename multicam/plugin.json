@@ -1,13 +1,13 @@
 {
   "id": "multicam",
-  "version": "0.5.8",
+  "version": "0.5.13",
   "upgrade_url": "http://192.0.2.221:8080/multicam/release.json",
   "name": {
     "zh": "米家双路摄像头",
     "en": "Mi Home Dual Camera"
   },
   "description": {
-    "zh": "将两路米家摄像头画面合成一路接入视觉检测，支持实时预览与取景调整。",
-    "en": "Combine two Mi Home cameras into one canvas for vision detection, with live preview and easy framing."
+    "zh": "将两路摄像头画面合成一路接入视觉检测，支持米家账号或 RTSP 自行接入，提供实时预览与取景调整。",
+    "en": "Combine two cameras (Mi Home or RTSP) into one canvas for vision detection, with live preview and easy framing."
   }
 }

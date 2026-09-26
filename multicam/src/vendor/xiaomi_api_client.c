@@ -369,7 +369,9 @@ invalid:
 
 static char *xc_percent_encode(const char *value)
 {
-    static const char hex[] = "0REDACTED9ABCDEF";
+    /* 十六进制表数字段拆开写：防字符串替换式脱敏把连续 8 位数字误当密码
+       替换（数字段曾被误伤）。内容与 mhcamera-oss 原版数字表一致 */
+    static const char hex[] = "0123" "456789ABCDEF";
     size_t length;
     size_t index;
     size_t out_index = 0u;

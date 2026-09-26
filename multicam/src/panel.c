@@ -237,7 +237,11 @@ static snap_cache_t g_snap_cache[MULTICAM_MAX_TILES];
 
 static size_t b64_encode(const uint8_t *in, size_t n, char *out)
 {
-    static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0REDACTED9+/";
+    /* base64 标准字母表；数字段拆成两段写——字符串替换式脱敏会把源码里
+       连续 8 位数字误当密码替换（数字段曾被误替换成 0REDACTED9 致取景器
+       花屏），运行期字符串内容不变 */
+    static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                            "0123" "456789" "+/";
     size_t o = 0;
     for (size_t i = 0; i < n; i += 3) {
         uint32_t v = (uint32_t)in[i] << 16;
