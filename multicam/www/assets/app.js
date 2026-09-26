@@ -72,6 +72,11 @@ function camLabel(slot) {
   const c = (state.cfg && state.cfg.cameras || []).find(c => (c.tile || 0) === slot);
   if (!c) return "摄像头 " + (slot + 1);
   if (c.name) return c.name;
+  const src = String(c.source || "");
+  if (src.startsWith("rtsp://")) {
+    const m = /@([0-9.]+)[:/?]/.exec(src) || /^rtsp:\/\/([0-9.]+)/.exec(src);
+    return m ? "自行接入 " + m[1] : "自行接入";
+  }
   const did = camDid(c);
   const dev = (state.devices || []).find(d => String(d.id) === did);
   return dev ? dev.name : (c.id || "摄像头 " + (slot + 1));
@@ -106,6 +111,13 @@ function renderStatus() {
 /* 取景器状态（每 tile 一份）：img=最新原画快照、x=框位置、busy 防重入。
    renderCameras 重跑（选机/刷新目录）时保留 img，画面不闪。 */
 const framers = {};
+/* 接入方式（每路）：米家 / 自行接入（rtsp:// 直连，无需米家授权）。
+   编辑态与输入草稿存模块级，renderCameras 重跑（加载设备目录）时不丢。 */
+const camModes = {}, srcDrafts = {};
+function modeOf(cam) {
+  return camModes[cam.tile]
+    || (String(cam.source || "").startsWith("rtsp://") ? "rtsp" : "xiaomi");
+}
 function drawFramer(tile) {
   const f = framers[tile];
   if (!f || !f.ctx) return;
@@ -162,13 +174,28 @@ function renderCameras() {
       `<option value="${d.id}" ${String(d.id) === did ? "selected" : ""}>${d.name || d.id}</option>`).join("");
     const cropX = cam.crop_x != null && cam.crop_x >= 0 ? cam.crop_x : 224;
     cam.crop_x = cropX;
+    const mode = modeOf(cam);
+    const srcVal = srcDrafts[cam.tile] != null ? srcDrafts[cam.tile]
+      : (String(cam.source || "").startsWith("rtsp://") ? cam.source : "");
 
     card.innerHTML = `
       <div class="cam-row">
         <input type="checkbox" class="cam-en" ${cam.enabled !== false ? "checked" : ""} title="启用">
         <span class="tile-label">第 ${(cam.tile ?? i) + 1} 路</span>
-        <select class="dev">${opts}</select>
-        <input class="src" type="text" placeholder="xiaomi:// 或 rtsp:// 源" value="${cam.source || ""}">
+        <div class="modeseg" role="group" aria-label="接入方式">
+          <button type="button" class="seg" data-mode="xiaomi">米家</button>
+          <button type="button" class="seg" data-mode="rtsp">自行接入</button>
+        </div>
+      </div>
+      <div class="src-row">
+        <select class="dev">
+          <option value="" ${did ? "" : "selected"}>选择米家设备…</option>
+          ${opts}
+        </select>
+        <div class="rtsp-part">
+          <input class="src" type="text" placeholder="rtsp://账号:密码@摄像头地址:554/路径" value="${srcVal.replace(/"/g, "&quot;")}" spellcheck="false">
+          <button type="button" class="btn micro src-go">连接</button>
+        </div>
       </div>
       <div class="framer">
         <canvas class="framer-cv" width="848" height="480"></canvas>
@@ -190,6 +217,19 @@ function renderCameras() {
         <input type="range" class="crop-slider" min="0" max="448" step="2" value="${cropX}">
       </div>`;
     card.querySelector(".cam-en").onchange = e => { cam.enabled = e.target.checked; markDirty(); };
+    /* 接入方式切换：只切编辑视图，不改源——米家模式选中设备、自行接入点「连接」才真正换源生效 */
+    card.querySelectorAll(".modeseg .seg").forEach(b => {
+      b.classList.toggle("active", b.dataset.mode === mode);
+      b.onclick = () => {
+        if (modeOf(cam) === b.dataset.mode) return;
+        camModes[cam.tile] = b.dataset.mode;
+        card.classList.toggle("mode-rtsp", b.dataset.mode === "rtsp");
+        card.querySelectorAll(".modeseg .seg").forEach(x =>
+          x.classList.toggle("active", x.dataset.mode === b.dataset.mode));
+        if (b.dataset.mode === "rtsp") card.querySelector(".src").focus();
+      };
+    });
+    card.classList.toggle("mode-rtsp", mode === "rtsp");
     /* 换源自动生效：调 source.set（后端落盘+就地重建该路，不重启进程），无需保存 */
     async function applySource(tile, src, label) {
       const name = `第 ${tile + 1} 路`;
@@ -203,18 +243,27 @@ function renderCameras() {
       }
     }
     card.querySelector(".dev").onchange = e => {
-      if (e.target.value === "__manual__") return;
       const dev = state.devices.find(d => String(d.id) === e.target.value);
       if (!dev) return;
       cam.source = sourceFor(dev, acct);
       cam.did = String(dev.id); cam.name = dev.name; cam.model = dev.model; cam.localip = dev.localip;
-      card.querySelector(".src").value = cam.source;
       applySource(cam.tile, cam.source, dev.name || dev.id);
     };
-    card.querySelector(".src").onchange = e => {
-      cam.source = e.target.value.trim();
-      if (cam.source) applySource(cam.tile, cam.source, "手动源");
-    };
+    /* 自行接入：填 rtsp:// 地址，回车/失焦或点「连接」即生效 */
+    function applyRtsp() {
+      const v = card.querySelector(".src").value.trim();
+      srcDrafts[cam.tile] = v;
+      if (!/^rtsp:\/\/\S+/.test(v)) {
+        $("save-msg").textContent = "请填写 rtsp:// 开头的摄像头地址";
+        return;
+      }
+      cam.source = v;
+      /* 清掉残留的米家设备元数据，状态芯片改按 rtsp 地址显示 */
+      cam.name = ""; cam.did = ""; cam.model = ""; cam.localip = "";
+      applySource(cam.tile, v, null);
+    }
+    card.querySelector(".src").onchange = applyRtsp;
+    card.querySelector(".src-go").onclick = applyRtsp;
 
     const slider = card.querySelector(".crop-slider");
     const valLabel = card.querySelector(".crop-val");

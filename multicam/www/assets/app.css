@@ -80,7 +80,17 @@ details.fold[open] summary::after { transform: rotate(-90deg); }
 .cam-card { border: 1px solid var(--line); border-radius: var(--r-card); padding: 10px 12px; background: var(--card); min-width: 0; }
 .cam-row { display: grid; grid-template-columns: 24px auto 1fr; gap: 8px; align-items: center; }
 .cam-row .tile-label { font-weight: 600; color: var(--primary); font-size: 13px; }
-.cam-row .src { display: none; }
+
+/* 接入方式切换（米家 / 自行接入）+ 源选择行 */
+.modeseg { justify-self: end; display: inline-flex; border: 1px solid var(--line); border-radius: 99px; background: var(--bg); overflow: hidden; }
+.modeseg .seg { font: inherit; font-size: 12px; padding: 3px 12px; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+.modeseg .seg.active { background: var(--primary); color: #fff; }
+.src-row { margin-top: 8px; }
+.src-row .dev { width: 100%; }
+.src-row .rtsp-part { display: none; gap: 6px; align-items: center; }
+.src-row .rtsp-part .src { flex: 1; min-width: 0; }
+.cam-card.mode-rtsp .src-row .dev { display: none; }
+.cam-card.mode-rtsp .src-row .rtsp-part { display: flex; }
 
 /* 取景器 */
 .framer { margin-top: 8px; }
