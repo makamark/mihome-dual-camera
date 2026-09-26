@@ -287,16 +287,9 @@ int g2r_start(g2r_instance_t *inst, char *err, size_t err_cap)
     fclose(fp);
     chmod(yaml, 0600);
 
-    /* Go 运行时内存上限（CPU 有余量，GC 频率换堆：8MiB×2 实例）。
-       GOMAXPROCS=1：单核 A53 上多 P 只会增加 OS 线程需求（sysmon/retake 等），
-       曾在系统线程配额收紧时致 newosproc errno=11 崩溃循环。 */
-    setenv("GOMEMLIMIT", "8MiB", 1);
-    setenv("GOGC", "30", 1);
-    setenv("GOMAXPROCS", "1", 1);
+    /* Go 运行时内存/线程上限（GOMEMLIMIT/GOGC/GOMAXPROCS）由 main() 进程级
+       一次性设置、子进程继承；并发启动下 setenv→fork→unsetenv 会竞态丢环境 */
     inst->pid = fork();
-    unsetenv("GOMEMLIMIT");
-    unsetenv("GOGC");
-    unsetenv("GOMAXPROCS");
     if (inst->pid == 0) {
         prctl(PR_SET_PDEATHSIG, SIGKILL); /* 父进程死后内核收尸，杜绝孤儿占端口 */
         int log = open(logp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -317,7 +310,8 @@ int g2r_start(g2r_instance_t *inst, char *err, size_t err_cap)
         usleep(200 * 1000);
     }
 
-    /* 下发源并等 running */
+    /* 下发源并等 running；state=error（离线/拒绝/坏源）已确定失败，快速返回
+       不等满窗——否则一台离线摄像头会把整体启动拖慢 20s */
     char body[768];
     snprintf(body, sizeof(body), "{\"source\":\"%s\"}", inst->source);
     bool source_ok = false;
@@ -328,11 +322,17 @@ int g2r_start(g2r_instance_t *inst, char *err, size_t err_cap)
             http_unix(sock, "GET", "/api/camera/source", NULL, resp, sizeof(resp));
             json_str(resp, "state", state, sizeof(state));
             if (!strcmp(state, "running")) { source_ok = true; break; }
+            if (!strcmp(state, "error")) break;
         }
         usleep(500 * 1000);
     }
     if (!source_ok) {
-        snprintf(err, err_cap, "go2rtc 源未进入 running（看 %s）", logp);
+        char reason[128] = "";
+        json_str(resp, "reason", reason, sizeof(reason));
+        if (reason[0])
+            snprintf(err, err_cap, "源拨号失败: %.90s（看 %s）", reason, logp);
+        else
+            snprintf(err, err_cap, "go2rtc 源未进入 running（看 %s）", logp);
         g2r_stop(inst);
         return -1;
     }

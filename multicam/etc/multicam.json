@@ -13,14 +13,14 @@
       "tile": 0,
       "crop_x": 224,
       "enabled": true,
-      "source": "xiaomi://1000000001:cn@192.0.2.154?did=2000000001&model=chuangmi.camera.81ac1&subtype=1&audio=0&transport=tcp"
+      "source": "xiaomi://"
     },
     {
       "id": "cam-b",
       "tile": 1,
       "crop_x": 224,
       "enabled": false,
-      "source": "xiaomi://<account>:cn@<camera-ip>?did=<did>&model=<model>&subtype=1&audio=0&transport=tcp"
+      "source": "xiaomi://"
     }
   ]
 }

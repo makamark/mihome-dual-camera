@@ -1,25 +1,38 @@
 #include "multicam.h"
 #include "vendor/cJSON.h"
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
-int config_load(multicam_config_t *cfg, const char *path)
+/* 全新安装引导默认配置（与包内 etc/multicam.json 保持一致）。
+   平台导入插件不落数据配置，首次启动时配置文件不存在——旧版直接退出，
+   监督器对快速退出的插件不再拉起，表现为"无法启用"；现自动落盘默认配置
+   并按默认运行（灰画布常驻），用户在面板选择设备/授权后即出画面。 */
+static const char *CONFIG_DEFAULT_JSON =
+    "{\n"
+    "  \"layout\": { \"version\": 3, \"type\": \"crop_1x2\", \"tile\": [400, 480] },\n"
+    "  \"output\": { \"fps\": 3, \"format\": \"yuv420p\" },\n"
+    "  \"capture\": { \"window\": true, \"window_frames\": 4 },\n"
+    "  \"go2rtc\": {\n"
+    "    \"binary\": \"\",\n"
+    "    \"mhcamera_yaml\": \"/data/plugins/mhcamera/go2rtc.yaml\",\n"
+    "    \"base_port\": 8554\n"
+    "  },\n"
+    "  \"cameras\": [\n"
+    "    { \"id\": \"cam-a\", \"tile\": 0, \"crop_x\": 224, \"enabled\": true, \"source\": \"xiaomi://\" },\n"
+    "    { \"id\": \"cam-b\", \"tile\": 1, \"crop_x\": 224, \"enabled\": false, \"source\": \"xiaomi://\" }\n"
+    "  ]\n"
+    "}\n";
+
+static int config_parse(multicam_config_t *cfg, const char *buf)
 {
-    FILE *fp = fopen(path, "rb");
-    char buf[16384];
-    size_t n;
     cJSON *root, *item, *sub, *it;
     int canvas_w = 0;
 
     memset(cfg, 0, sizeof(*cfg));
-    if (!fp) { fprintf(stderr, "multicam: cannot open config %s\n", path); return -1; }
-    n = fread(buf, 1, sizeof(buf) - 1, fp);
-    fclose(fp);
-    buf[n] = 0;
-
     root = cJSON_Parse(buf);
     if (!root) { fprintf(stderr, "multicam: config parse failed\n"); return -1; }
 
@@ -138,5 +151,34 @@ int config_load(multicam_config_t *cfg, const char *path)
     fprintf(stderr, "multicam: config ok canvas=%dx%d tiles=%d cols=%d fps=%d\n",
             cfg->canvas_w, cfg->canvas_h, cfg->camera_count, cfg->layout_cols,
             cfg->fps);
+    return 0;
+}
+
+int config_load(multicam_config_t *cfg, const char *path)
+{
+    char buf[16384];
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        /* 首次启动无数据配置：落盘默认配置并按默认运行（绝不退出） */
+        fprintf(stderr, "multicam: 配置 %s 不存在（全新安装），写入默认配置\n", path);
+        FILE *w = fopen(path, "wb");
+        if (w) {
+            size_t len = strlen(CONFIG_DEFAULT_JSON);
+            if (fwrite(CONFIG_DEFAULT_JSON, 1, len, w) != len)
+                fprintf(stderr, "multicam: ⚠ 默认配置写盘不完整\n");
+            fclose(w);
+        } else {
+            fprintf(stderr, "multicam: ⚠ 默认配置写盘失败(%s)，仅内存生效\n", strerror(errno));
+        }
+        return config_parse(cfg, CONFIG_DEFAULT_JSON);
+    }
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    buf[n] = 0;
+    if (config_parse(cfg, buf) != 0) {
+        /* 配置损坏也按默认运行（不覆盖原文件，留待用户在面板重存） */
+        fprintf(stderr, "multicam: 配置 %s 解析失败，按默认配置运行\n", path);
+        return config_parse(cfg, CONFIG_DEFAULT_JSON);
+    }
     return 0;
 }

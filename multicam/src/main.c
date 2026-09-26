@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -20,7 +22,7 @@
 #endif
 
 #define TILE_STALE_MS 3000
-#define FIRST_FRAME_TIMEOUT_MS 40000
+#define FIRST_FRAME_TIMEOUT_MS 20000
 #define G2R_RESPAWN_MIN_MS 5000
 #define G2R_RESPAWN_MAX_MS 60000
 /* tile 持续置灰超过该时长 → 强制重建 go2rtc 实例
@@ -92,6 +94,20 @@ static void default_config_path(char *out, size_t cap)
     const char *data = getenv("AINICE_PLUGIN_DATA");
     if (data && data[0]) snprintf(out, cap, "%s/multicam.json", data);
     else snprintf(out, cap, "etc/multicam.json");
+}
+
+/* 全新安装时数据目录可能不存在（导入只装程序不建运行目录）；
+   tmp/ 供 go2rtc 实例 socket/日志与授权服务使用，缺失会让授权与实例全挂 */
+static void ensure_data_dirs(void)
+{
+    const char *data = getenv("AINICE_PLUGIN_DATA");
+    char p[512];
+    if (!data || !data[0]) return;
+    if (mkdir(data, 0755) == 0)
+        fprintf(stderr, "multicam: 创建数据目录 %s\n", data);
+    snprintf(p, sizeof(p), "%s/tmp", data);
+    if (mkdir(p, 0755) == 0)
+        fprintf(stderr, "multicam: 创建运行目录 %s\n", p);
 }
 
 static int set_input_mode_bitstream(void)
@@ -189,6 +205,12 @@ static void *g2r_watcher(void *arg)
     return NULL;
 }
 
+/* 占位空源（默认配置的 xiaomi://）视为未配置：不拉实例不拨号，置灰待配置 */
+static bool cam_unconfigured(const multicam_camera_t *cam)
+{
+    return !strncmp(cam->source, "xiaomi://", 9) && cam->source[9] == 0;
+}
+
 /* ---------- run 模式：真实拉流 → 软解 → 合成 → 推流 ---------- */
 
 static int run(const multicam_config_t *cfg)
@@ -202,6 +224,7 @@ static int run(const multicam_config_t *cfg)
     g2r_instance_t inst[MULTICAM_MAX_TILES];
     capture_t caps[MULTICAM_MAX_TILES];
     char urls[MULTICAM_MAX_TILES][512];
+    bool lane_g2r[MULTICAM_MAX_TILES] = {false};  /* xiaomi 路（有 go2rtc 实例） */
     bool cap_started[MULTICAM_MAX_TILES] = {false};
     uint8_t *canvas = NULL;
     push_t push = {0};
@@ -240,25 +263,37 @@ static int run(const multicam_config_t *cfg)
         slot_owner[t] = n;
         n++;
     }
-    if (n == 0) { fprintf(stderr, "multicam: 没有启用的摄像头\n"); goto out; }
     for (int j = 0; j < n; j++)
         if (cam_tile[j] + 1 > n_slots) n_slots = cam_tile[j] + 1;
+    if (n == 0) {
+        /* 全部禁用也灰画布常驻：进程退出后监督器不再拉起，
+           用户会卡死在"无法启用"，面板仍可改配置/授权等恢复 */
+        fprintf(stderr, "multicam: 没有启用的摄像头，灰画布常驻\n");
+        n_slots = cfg->camera_count > 0 ? cfg->camera_count : 1;
+        if (n_slots > MULTICAM_MAX_TILES) n_slots = MULTICAM_MAX_TILES;
+    }
 
+    /* 串行启动（实测单核+NAND 上并发 fork/exec 两个 Go 二进制互相拖慢，
+       且串行时下一路启动与上一路拨号等待自然重叠）；
+       未配置占位源直接置灰待配置，不拉实例不拨号 */
     for (int j = 0; j < n; j++) {
         const multicam_camera_t *cam = &cfg->cameras[cam_cfg[j]];
-        /* rtsp:// 源直连（无需 go2rtc 认证包装）；其余（xiaomi://）走 go2rtc 实例 */
+        if (cam_unconfigured(cam)) {
+            fprintf(stderr, "multicam: cam[%d](%s) tile %d 未配置源，置灰待配置\n",
+                    cam_cfg[j], cam->id, cam_tile[j]);
+            continue;
+        }
+        /* rtsp:// 源直连（无需 go2rtc 认证包装）；其余（xiaomi://）走 go2rtc 实例。
+           捕获启动统一放到后面，避免启动中途走清理路径的悬空状态 */
         if (!strncmp(cam->source, "rtsp://", 7)) {
             inst[j].pid = 0;
+            snprintf(urls[j], sizeof(urls[j]), "%s", cam->source);
             fprintf(stderr, "multicam: cam[%d](%s) tile %d 直连 %s\n",
                     cam_cfg[j], cam->id, cam_tile[j], cam->source);
-            if (capture_start(&caps[j], cam->source) != 0) {
-                fprintf(stderr, "multicam: capture[%d] 启动失败\n", j);
-                goto out;
-            }
-            cap_started[j] = true;
             continue;
         }
         g2r_instance_t *g = &inst[j];
+        lane_g2r[j] = true;
         g->index = j;
         g->port = cfg->base_port + j;
         snprintf(g->source, sizeof(g->source), "%s", cam->source);
@@ -282,7 +317,7 @@ static int run(const multicam_config_t *cfg)
     }
 
     for (int j = 0; j < n; j++) {
-        if (cap_started[j]) continue;
+        if (cap_started[j] || !urls[j][0]) continue;   /* 未配置路无 pull 地址 */
         if (capture_start(&caps[j], urls[j]) != 0) {
             fprintf(stderr, "multicam: capture[%d] 启动失败\n", j);
             goto out;
@@ -292,17 +327,29 @@ static int run(const multicam_config_t *cfg)
     /* 取景器快照绑定：tile → 捕获下标（bridge preview.full 用） */
     panel_bind_captures(caps, slot_owner, MULTICAM_MAX_TILES);
 
-    /* 等首帧以确定 tile 尺寸；降级容忍：至少一路有帧即可（其余路由 watcher 补救） */
+    /* watcher 与面板 bridge 尽早启动：bridge 只依赖配置文件（面板启动握手即
+       config.get），启动拨号期间面板即可打开；watcher 提前重建失败实例 */
+    if (pthread_create(&watcher_th, NULL, g2r_watcher, &wctx) == 0)
+        watcher_started = true;
+    if (panel_start() != 0)
+        fprintf(stderr, "multicam: ⚠ 面板 bridge 线程启动失败（Web 设置不可用）\n");
+
+    /* 等首帧以确定 tile 尺寸；降级容忍：至少一路有帧即可（其余路由 watcher 补救）。
+       等不回首帧的路（拨号失败待重建/未配置）不计入等待——由推送循环的置灰与
+       自愈机制接管，画面到位后自动亮起，不阻塞画布起播 */
     {
         int64_t deadline = (int64_t)now_us() / 1000 + FIRST_FRAME_TIMEOUT_MS;
         while ((int64_t)now_us() / 1000 < deadline && !g_stop) {
-            int ready = 0;
+            int ready = 0, pending = 0;
             for (int j = 0; j < n; j++) {
                 int w, h;
                 capture_dims(&caps[j], &w, &h);
-                if (w > 0) ready++;
+                if (w > 0) { ready++; continue; }
+                if (lane_g2r[j] && inst[j].restart_pending) continue;  /* 拨号失败待重建 */
+                if (!lane_g2r[j] && !cap_started[j]) continue;         /* 未配置源 */
+                pending++;
             }
-            if (ready == n) break;
+            if (ready == n || pending == 0) break;
             usleep(300 * 1000);
         }
         for (int j = 0; j < n; j++) {
@@ -315,9 +362,10 @@ static int run(const multicam_config_t *cfg)
             }
             if (src_w == 0) { src_w = w; src_h = h; }
             else if (w != src_w || h != src_h) {
-                fprintf(stderr, "multicam: cam[%d](%s) 分辨率 %dx%d 与首路 %dx%d 不一致（v1 要求一致）\n",
+                /* 不再整体退出（监督器不拉起 = 用户卡死"无法启用"）：
+                   paint 阶段按 -2 自校验把该路置灰（"分辨率不符"） */
+                fprintf(stderr, "multicam: cam[%d](%s) 分辨率 %dx%d 与首路 %dx%d 不一致，该路置灰继续\n",
                         cam_cfg[j], cfg->cameras[cam_cfg[j]].id, w, h, src_w, src_h);
-                goto out;
             }
         }
         if (src_w == 0) {
@@ -356,11 +404,6 @@ static int run(const multicam_config_t *cfg)
     size_t ysz = (size_t)canvas_w * canvas_h;
 
     /* 检测区域由设备侧 zone profile 管理（总览界面绘制），插件不再下发 */
-
-    if (pthread_create(&watcher_th, NULL, g2r_watcher, &wctx) == 0)
-        watcher_started = true;
-    if (panel_start() != 0)
-        fprintf(stderr, "multicam: ⚠ 面板 bridge 线程启动失败（Web 设置不可用）\n");
 
     /* 推送主循环；send_frame 失败（管线复位/mhcamera 过渡等）时重建会话续推。
        快照直接按行距写进画布 tile 区域（无中间 tile 缓冲）。
@@ -534,6 +577,8 @@ static int run(const multicam_config_t *cfg)
                             slot_gray[s] = true;
                             gray_since[s] = now0;
                             snprintf(slot_note[s], sizeof(slot_note[s]), "%s",
+                                     owner < 0 ? "该路未启用" :
+                                     cam_unconfigured(&cfg->cameras[cam_cfg[owner]]) ? "该路待配置" :
                                      age == -2 ? "分辨率不符" :
                                      age < 0 ? "无帧（拨号/解码未就绪）" : "断流超时");
                             fprintf(stderr, "multicam: tile %d 置灰（%s）\n", s, slot_note[s]);
@@ -722,6 +767,13 @@ int main(int argc, char **argv)
 
     panel_init((volatile int *)&g_stop, (volatile int *)&g_reload, cfg_path);
 
+    ensure_data_dirs();
+    /* Go 子进程（go2rtc 实例/授权实例）运行时环境进程级一次性设置：
+       此前在各 g2r_start 里 setenv→fork→unsetenv，并发启动时存在
+       子进程缺环境（GOMAXPROCS 等）的竞态；值恒定，进程级最稳 */
+    setenv("GOMEMLIMIT", "8MiB", 1);
+    setenv("GOGC", "30", 1);
+    setenv("GOMAXPROCS", "1", 1);
     if (config_load(&cfg, cfg_path) != 0) return 1;
     if (selftest_mode) {
         int cols = cfg.layout_cols > 0 ? cfg.layout_cols : 2;

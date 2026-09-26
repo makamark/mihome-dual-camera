@@ -3,14 +3,18 @@ TOP      ?= ..
 CROSS    ?= aarch64-linux-gnu-
 SYSROOT  ?= $(TOP)/reference/device/rootfs
 FFMPEG   ?= $(TOP)/thirdparty/ffmpeg-aarch64
-VERSION  ?= 0.5.8
+VERSION  ?= 0.5.13
 
 CC       := $(CROSS)gcc
 CFLAGS   := -O2 -Wall -Wextra -std=gnu11 -mcpu=cortex-a53 -mtune=cortex-a53 \
             -I$(SYSROOT)/usr/include -I$(FFMPEG)/include -Isrc
 LDFLAGS  := -L$(SYSROOT)/usr/lib -L$(SYSROOT)/lib -L$(FFMPEG)/lib \
             -Wl,-rpath-link,$(SYSROOT)/usr/lib -Wl,-rpath-link,$(SYSROOT)/lib \
-            -Wl,-rpath-link,$(FFMPEG)/lib
+            -Wl,-rpath-link,$(FFMPEG)/lib \
+            -Wl,-rpath,'$$ORIGIN/libs'
+# 说明：ffmpeg 库随包放在 libs/。实测平台启动器不保证设置 LD_LIBRARY_PATH
+# （开发机 ldd 显示 not found，全靠启动器环境兜底），RPATH $ORIGIN/libs 让
+# 二进制在任何设备上都能从自身旁的 libs/ 解析，不再依赖启动器行为。
 LDLIBS   := -l:libainice.so -lavformat -lavcodec -lavutil -l:libc.so.6 -lpthread
 # 说明：libainice.so 按设备 glibc 2.38 构建（__isoc23_* 符号），故显式链设备的
 # libc.so.6（sysroot lib/），工具链自带的 2.35 libc 仅用于头文件。
