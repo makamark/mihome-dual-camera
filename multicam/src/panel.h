@@ -19,6 +19,8 @@ typedef struct {
     uint64_t decoded;     /* 该路累计解码帧数（抽帧有效性观测） */
     int keyint_ms;        /* 实测 GOP 间隔（窗口解码观测，0=未测量） */
     int g2r_port;
+    char g2r_user[24];   /* 该路 RTSP 输出凭证（面板拼局域网取流地址供复制） */
+    char g2r_pass[24];
     int g2r_rss_kb;       /* go2rtc 子进程常驻内存（0=不在场） */
     bool g2r_alive;
     int crop_x;           /* 当前水平裁切起点 */
@@ -32,6 +34,8 @@ typedef struct {
     int canvas_w, canvas_h, fps;
     int tile_w, tile_h;   /* 单 tile 尺寸（面板叠加/标定的几何换算用） */
     int layout_cols;      /* tile 网格列数（1 = 竖排） */
+    int squeeze_pct;      /* 横向压缩系数 ×100（100 = 不压缩） */
+    int win_w;            /* crop_1x2 每路取景窗口宽（取景器蓝框宽度） */
     uint64_t frames;
     int session_failures;
     int n_slots, n_cams;

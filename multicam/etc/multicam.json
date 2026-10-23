@@ -1,5 +1,5 @@
 {
-  "layout": { "version": 3, "type": "crop_1x2", "tile": [400, 480] },
+  "layout": { "version": 3, "type": "crop_1x2", "tile": [400, 480], "squeeze": 1.0 },
   "output": { "fps": 3, "format": "yuv420p" },
   "capture": { "window": true, "window_frames": 4 },
   "go2rtc": {

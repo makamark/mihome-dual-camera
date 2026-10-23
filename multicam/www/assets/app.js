@@ -5,6 +5,17 @@ const $ = (id) => document.getElementById(id);
 
 const TILE_W = 848, TILE_H = 480;
 
+/* 取景宽度（横向压缩）：每路取景窗口宽 = 400×压缩系数，钳到 ≤848。
+   窗口比 400 宽时画面被水平压进 tile——覆盖更宽、人略显瘦，画布几何不变。 */
+function squeezeVal() {
+  const s = +(state.cfg && state.cfg.layout && state.cfg.layout.squeeze || 1);
+  return s >= 1 && s <= 2.5 ? s : 1;
+}
+function winW() {
+  /* 与后端整型算法一致：win = 400×round(s×100)/100，防止自定义压缩率下取景框差 2px */
+  return Math.min(TILE_W, Math.floor(400 * Math.round(squeezeVal() * 100) / 100)) & ~1;
+}
+
 const state = {
   cfg: null,          // config.get 的完整文档（可编辑副本）
   devices: [],        // [{id,name,model,localip}]
@@ -121,7 +132,7 @@ function modeOf(cam) {
 function drawFramer(tile) {
   const f = framers[tile];
   if (!f || !f.ctx) return;
-  const cx = f.ctx, W = 848, H = 480, BW = 400;
+  const cx = f.ctx, W = 848, H = 480, BW = winW();
   if (f.img) cx.drawImage(f.img, 0, 0, W, H);
   else {
     cx.fillStyle = "#101214"; cx.fillRect(0, 0, W, H);
@@ -137,7 +148,7 @@ function drawFramer(tile) {
   cx.strokeRect(x + 1.5, 1.5, BW - 3, H - 3);
   cx.fillStyle = "rgba(76, 167, 255, 0.95)";
   cx.font = "16px sans-serif";
-  cx.fillText(`画框 ${x}`, x + 10, 30);
+  cx.fillText(`画框 ${x} · 宽 ${BW}`, x + 10, 30);
 }
 async function refreshFramer(tile) {
   const f = framers[tile];
@@ -172,8 +183,11 @@ function renderCameras() {
     const did = camDid(cam);
     const opts = state.devices.map(d =>
       `<option value="${d.id}" ${String(d.id) === did ? "selected" : ""}>${d.name || d.id}</option>`).join("");
-    const cropX = cam.crop_x != null && cam.crop_x >= 0 ? cam.crop_x : 224;
+    /* 取景窗口随压缩系数变化：蓝框宽 winW()，滑条范围 0..848-宽，居中=范围一半 */
+    const BW = winW(), maxX = 848 - BW, centerX = (maxX / 2) & ~1;
+    const cropX = cam.crop_x != null && cam.crop_x >= 0 ? Math.min(cam.crop_x & ~1, maxX) : centerX;
     cam.crop_x = cropX;
+    const cropName = x => x === 0 ? "靠左" : x === maxX ? "靠右" : x === centerX ? "居中" : "自定义";
     const mode = modeOf(cam);
     const srcVal = srcDrafts[cam.tile] != null ? srcDrafts[cam.tile]
       : (String(cam.source || "").startsWith("rtsp://") ? cam.source : "");
@@ -207,16 +221,33 @@ function renderCameras() {
       <div class="crop-control">
         <div class="crop-header">
           <span>取景位置</span>
-          <span class="crop-val">${cropX === 0 ? "靠左" : cropX === 448 ? "靠右" : cropX === 224 ? "居中" : "自定义"}</span>
+          <span class="crop-val">${cropName(cropX)}</span>
           <div class="crop-presets">
             <button type="button" class="btn micro" data-x="0">靠左</button>
-            <button type="button" class="btn micro" data-x="224">居中</button>
-            <button type="button" class="btn micro" data-x="448">靠右</button>
+            <button type="button" class="btn micro" data-x="${centerX}">居中</button>
+            <button type="button" class="btn micro" data-x="${maxX}">靠右</button>
           </div>
         </div>
-        <input type="range" class="crop-slider" min="0" max="448" step="2" value="${cropX}">
-      </div>`;
+        <input type="range" class="crop-slider" min="0" max="${maxX}" step="2" value="${cropX}">
+      </div>
+      <div class="rtsp-row" title="米家源同一时间只允许一个观看者：勾选「供外部播放」让出观看位后，外部播放器（VLC 等）才能连接；未勾选时该地址被插件自身占用">
+        <span class="rtsp-label">取流地址</span>
+        <input class="rtsp-url" type="text" readonly spellcheck="false" placeholder="运行后显示" data-tile="${cam.tile ?? i}">
+        <button type="button" class="btn micro rtsp-copy">复制</button>
+      </div>
+      ${mode === "xiaomi" ? `
+      <div class="ext-row">
+        <label class="ext-lab"><input type="checkbox" class="cam-ext" ${cam.external ? "checked" : ""}> 供外部播放（暂停本路检测，地址可连接）</label>
+      </div>` : ""}`;
     card.querySelector(".cam-en").onchange = e => { cam.enabled = e.target.checked; markDirty(); };
+    const extCb = card.querySelector(".cam-ext");
+    if (extCb) extCb.onchange = e => {
+      cam.external = e.target.checked;
+      markDirty();
+      $("save-msg").textContent = e.target.checked
+        ? "保存后该路暂停检测，取流地址可供外部播放器使用"
+        : "保存后恢复该路检测";
+    };
     /* 接入方式切换：只切编辑视图，不改源——米家模式选中设备、自行接入点「连接」才真正换源生效 */
     card.querySelectorAll(".modeseg .seg").forEach(b => {
       b.classList.toggle("active", b.dataset.mode === mode);
@@ -260,6 +291,7 @@ function renderCameras() {
       cam.source = v;
       /* 清掉残留的米家设备元数据，状态芯片改按 rtsp 地址显示 */
       cam.name = ""; cam.did = ""; cam.model = ""; cam.localip = "";
+      cam.external = false;   /* rtsp 直连无实例可让位，归一化（后端落盘同样会清） */
       applySource(cam.tile, v, null);
     }
     card.querySelector(".src").onchange = applyRtsp;
@@ -272,10 +304,10 @@ function renderCameras() {
     framer.ctx = framer.canvas.getContext("2d");
     framer.x = cropX;
     function updateCrop(x) {
-      x = Math.max(0, Math.min(448, parseInt(x, 10) & ~1));
+      x = Math.max(0, Math.min(maxX, parseInt(x, 10) & ~1));
       cam.crop_x = x;
       slider.value = x;
-      valLabel.textContent = x === 0 ? "靠左" : x === 448 ? "靠右" : x === 224 ? "居中" : "自定义";
+      valLabel.textContent = cropName(x);
       framer.x = x;
       drawFramer(cam.tile);
       markDirty();
@@ -293,7 +325,7 @@ function renderCameras() {
       const dragTo = e => {
         const r = cv.getBoundingClientRect();
         const px = (e.clientX - r.left) * (848 / r.width);
-        updateCrop(Math.round(px) - 200);
+        updateCrop(Math.round(px) - BW / 2);
       };
       cv.onpointerdown = e => { dragging = true; cv.setPointerCapture(e.pointerId); dragTo(e); };
       cv.onpointermove = e => { if (dragging) dragTo(e); };
@@ -305,6 +337,17 @@ function renderCameras() {
       cv.onpointercancel = () => { dragging = false; };
     }
     card.querySelector(".framer-rl").onclick = () => refreshFramer(cam.tile);
+    /* 取流地址一键复制：clipboard API 在控制台 iframe 可能被权限拦，回落 execCommand */
+    card.querySelector(".rtsp-copy").onclick = async () => {
+      const inp = card.querySelector(".rtsp-url");
+      if (!inp.value) return flash("暂无取流地址（该路未运行）");
+      let ok = false;
+      try { await navigator.clipboard.writeText(inp.value); ok = true; } catch (e) {
+        inp.select();
+        try { ok = document.execCommand("copy"); } catch (e2) {}
+      }
+      flash(ok ? "取流地址已复制" : "复制失败，请全选地址手动复制");
+    };
     refreshFramer(cam.tile);
     wrap.appendChild(card);
   });
@@ -440,6 +483,14 @@ async function loadAll() {
     delete state.cfg.zones;
     if (!state.cfg.cameras) state.cfg.cameras = [];
     $("fps").value = String((state.cfg.output && state.cfg.output.fps) || 3);
+    const sv = String(squeezeVal());
+    if (![...$("squeeze").options].some(o => o.value === sv)) {
+      const o = document.createElement("option");
+      o.value = sv;
+      o.textContent = `自定义 ${sv}×`;
+      $("squeeze").appendChild(o);
+    }
+    $("squeeze").value = sv;
     renderCameras();
     refreshDeviceZones();
     notifyReady();   /* 配置就绪即完成启动握手；状态/映射继续后台轮询 */
@@ -458,7 +509,27 @@ async function refreshStatus() {
     state.status = r.status;
     if (!canvas.width) canvasResize();
     renderStatus();
+    updateRtspRows();
   } catch (e) { /* 重启间隙 */ }
+}
+
+/* 局域网取流地址：米家路 = 设备上 go2rtc 实例的认证 RTSP 输出
+   （rtsp://viewer:密码@设备IP:855x/stream），自行接入路 = 源地址本身。
+   凭证/端口来自运行状态（3s 轮询），随状态自动刷新。 */
+function updateRtspRows() {
+  const st = state.status;
+  document.querySelectorAll(".rtsp-url").forEach(inp => {
+    const tile = +(inp.dataset.tile ?? -1);
+    const cam = (state.cfg.cameras || []).find(c => (c.tile ?? 0) === tile);
+    let url = "";
+    if (cam && String(cam.source || "").startsWith("rtsp://")) url = cam.source;
+    else if (st && st.valid) {
+      const t = (st.tiles || []).find(x => x.slot === tile);
+      if (t && t.g2r_port > 0 && t.g2r_pass)
+        url = `rtsp://${t.g2r_user || "viewer"}:${t.g2r_pass}@${location.hostname}:${t.g2r_port}/stream`;
+    }
+    if (inp.value !== url) inp.value = url;
+  });
 }
 setInterval(refreshStatus, 3000);
 
@@ -627,6 +698,14 @@ function markClean() {
 function flash(msg) { $("save-msg").textContent = msg; setTimeout(() => { if ($("save-msg").textContent === msg) $("save-msg").textContent = ""; }, 5000); }
 
 $("fps").onchange = e => { state.cfg.output = state.cfg.output || {}; state.cfg.output.fps = +e.target.value; markDirty(); };
+
+$("squeeze").onchange = e => {
+  state.cfg.layout = state.cfg.layout || {};
+  state.cfg.layout.squeeze = +e.target.value;
+  markDirty();
+  renderCameras();   /* 取景蓝框宽度/滑条范围随窗口宽度联动（framers 保留画面不闪） */
+  $("save-msg").textContent = "取景宽度已调整，点「保存并应用」后生效";
+};
 
 $("save").onclick = async () => {
   const b = $("save");

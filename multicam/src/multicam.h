@@ -10,8 +10,11 @@
 typedef struct {
     char id[64];
     int tile;
-    int crop_x;           /* 水平裁切起点（0..448，-1 表示自动居中 (src_w - 400)/2） */
+    int crop_x;           /* 水平裁切起点（0..src_w-取景宽，-1 表示自动居中） */
     int enabled;
+    int external;         /* 供外部播放：go2rtc 实例照跑但本插件不拉流（厂商
+                             RTSP 输出为单观看者，让出唯一观看位给外部播放器），
+                             该路置灰暂停检测 */
     char source[256];
 } multicam_camera_t;
 
@@ -22,6 +25,9 @@ typedef struct {
     int layout_version;
     char layout_type[32]; /* "crop_1x2"（默认推荐左右并排裁切）或旧版 "1x2" / "2x1" */
     int layout_cols;      /* layout.type "行x列" 的列数；0 = 单行横排（兼容旧配置） */
+    int squeeze_pct;      /* 横向压缩系数 ×100（crop_1x2：每路取景窗口宽 = 400×系数。
+                             >100 时更宽的源窗口被压进 400 宽 tile——画面横向变瘦、
+                             实际覆盖更宽；画布几何 800×480 不变。100..250） */
     int tile_w, tile_h;   /* crop_1x2 下为 400x480，旧版由实际流决定 */
     int canvas_w, canvas_h; /* crop_1x2 下为 800x480 (5:3) */
     int fps;

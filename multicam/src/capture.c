@@ -410,3 +410,89 @@ int64_t capture_paint_crop(capture_t *cap, uint8_t *dst_y, uint8_t *dst_u, uint8
     pthread_mutex_unlock(&cap->lock);
     return age;
 }
+
+/* 缩放映射表宽度上限（crop_1x2 的 tile 固定 400，留余量到 512） */
+#define SQUEEZE_MAX_W 512
+
+int64_t capture_paint_squeeze(capture_t *cap, uint8_t *dst_y, uint8_t *dst_u, uint8_t *dst_v,
+                              int dst_y_stride, int dst_c_stride,
+                              int crop_x, int crop_y,
+                              int win_w, int win_h,
+                              int out_w, int out_h)
+{
+    if (out_w <= 0 || out_w > SQUEEZE_MAX_W || out_w & 1) return -3;
+    pthread_mutex_lock(&cap->lock);
+    if (!cap->slot.data) {
+        pthread_mutex_unlock(&cap->lock);
+        return -1;
+    }
+    int w = cap->slot.w, h = cap->slot.h;
+    if (win_w <= 0 || win_h <= 0 || win_h != out_h || h < win_h || win_w & 1) {
+        pthread_mutex_unlock(&cap->lock);
+        return -2;
+    }
+    if (w < win_w) {   /* 窗口宽于源（低分辨率 rtsp 源）：收敛为整幅 */
+        win_w = w & ~1;
+        crop_x = 0;
+    }
+    crop_x &= ~1;   /* 与 capture_paint_crop 一致：色度平面半宽，奇数起点会半像素错位 */
+    crop_y &= ~1;
+    if (crop_y < 0) crop_y = 0;
+    if (crop_y + win_h > h) crop_y = (h - win_h) & ~1;
+    if (crop_x < 0) crop_x = (w - win_w) / 2 & ~1;
+    if (crop_x > w - win_w) crop_x = (w - win_w) & ~1;
+
+    /* 水平映射表：亮度与色度各自建（采样中心对齐，缩放比相同但原点差半像素）。
+       f 取 0..256 定点，(a*(256-f)+b*f+128)>>8 双线性插值，f=0 退化为直拷。 */
+    int16_t lx0[SQUEEZE_MAX_W], lx1[SQUEEZE_MAX_W], lfw[SQUEEZE_MAX_W];
+    int16_t cx0[SQUEEZE_MAX_W / 2], cx1[SQUEEZE_MAX_W / 2], cfw[SQUEEZE_MAX_W / 2];
+    for (int x = 0; x < out_w; x++) {
+        double s = crop_x + (x + 0.5) * (double)win_w / out_w - 0.5;
+        int x0 = (int)s;
+        if (x0 < 0) x0 = 0;
+        if (x0 > win_w - 1) x0 = win_w - 1;
+        int x1 = x0 + 1 < win_w ? x0 + 1 : x0;
+        double f = s - x0;
+        if (f < 0) f = 0;
+        if (f > 1) f = 1;
+        lx0[x] = (int16_t)(crop_x + x0);
+        lx1[x] = (int16_t)(crop_x + x1);
+        lfw[x] = (int16_t)(f * 256 + 0.5);
+    }
+    int cw_out = out_w / 2, cw_win = win_w / 2, cw_crop = crop_x / 2;
+    for (int x = 0; x < cw_out; x++) {
+        double s = cw_crop + (x + 0.5) * (double)cw_win / cw_out - 0.5;
+        int x0 = (int)s;
+        if (x0 < 0) x0 = 0;
+        if (x0 > cw_win - 1) x0 = cw_win - 1;
+        int x1 = x0 + 1 < cw_win ? x0 + 1 : x0;
+        double f = s - x0;
+        if (f < 0) f = 0;
+        if (f > 1) f = 1;
+        cx0[x] = (int16_t)(cw_crop + x0);
+        cx1[x] = (int16_t)(cw_crop + x1);
+        cfw[x] = (int16_t)(f * 256 + 0.5);
+    }
+
+    const uint8_t *src = cap->slot.data;
+    size_t ysz = (size_t)w * h, usz = ysz / 4;
+    for (int row = 0; row < out_h; row++) {
+        const uint8_t *sy = src + (size_t)(crop_y + row) * w;
+        uint8_t *dy = dst_y + (size_t)row * dst_y_stride;
+        for (int x = 0; x < out_w; x++)
+            dy[x] = (uint8_t)((sy[lx0[x]] * (256 - lfw[x]) + sy[lx1[x]] * lfw[x] + 128) >> 8);
+    }
+    for (int row = 0; row < out_h / 2; row++) {
+        const uint8_t *su = src + ysz + (size_t)(crop_y / 2 + row) * (w / 2);
+        const uint8_t *sv = su + usz;
+        uint8_t *du = dst_u + (size_t)row * dst_c_stride;
+        uint8_t *dv = dst_v + (size_t)row * dst_c_stride;
+        for (int x = 0; x < cw_out; x++) {
+            du[x] = (uint8_t)((su[cx0[x]] * (256 - cfw[x]) + su[cx1[x]] * cfw[x] + 128) >> 8);
+            dv[x] = (uint8_t)((sv[cx0[x]] * (256 - cfw[x]) + sv[cx1[x]] * cfw[x] + 128) >> 8);
+        }
+    }
+    int64_t age = now_ms() - cap->slot.updated_ms;
+    pthread_mutex_unlock(&cap->lock);
+    return age;
+}

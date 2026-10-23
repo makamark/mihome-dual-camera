@@ -106,6 +106,13 @@ details.fold[open] summary::after { transform: rotate(-90deg); }
 .crop-presets { display: flex; gap: 4px; }
 .crop-slider { width: 100%; cursor: pointer; accent-color: var(--primary); margin: 2px 0; }
 
+/* 局域网取流地址（米家路 = 设备认证 RTSP 输出；供 VLC/HA 等复制使用） */
+.rtsp-row { margin-top: 8px; display: flex; gap: 6px; align-items: center; font-size: 12px; color: var(--muted); }
+.rtsp-row .rtsp-label { flex: none; }
+.rtsp-row .rtsp-url { flex: 1; min-width: 0; font-size: 11px; padding: 3px 8px; font-family: ui-monospace, monospace; }
+.ext-row { margin-top: 6px; }
+.ext-lab { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; cursor: pointer; }
+
 /* 按钮 */
 .btn { font: inherit; padding: 6px 14px; border: 1px solid var(--line); border-radius: var(--r-ctl); background: var(--card); color: var(--text); cursor: pointer; transition: transform .08s; }
 .btn:active { transform: scale(.97); }

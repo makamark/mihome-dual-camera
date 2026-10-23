@@ -230,6 +230,7 @@ static int run(const multicam_config_t *cfg)
     push_t push = {0};
     int tile_w = 0, tile_h = 0, canvas_w = 0, canvas_h = 0;
     int src_w = 0, src_h = 0;
+    int win_w = 0;                     /* crop_1x2 每路取景窗口宽（>tile_w = 横向压缩） */
     bool push_opened = false;
     pthread_t watcher_th;
     bool watcher_started = false;
@@ -318,6 +319,13 @@ static int run(const multicam_config_t *cfg)
 
     for (int j = 0; j < n; j++) {
         if (cap_started[j] || !urls[j][0]) continue;   /* 未配置路无 pull 地址 */
+        /* 供外部播放：实例照跑（RTSP 输出可用），但本插件不拉流——
+           厂商 RTSP 输出单观看者，观看位让给外部播放器 */
+        if (cfg->cameras[cam_cfg[j]].external) {
+            fprintf(stderr, "multicam: cam[%d](%s) tile %d 供外部播放，跳过捕获（该路检测暂停）\n",
+                    cam_cfg[j], cfg->cameras[cam_cfg[j]].id, cam_tile[j]);
+            continue;
+        }
         if (capture_start(&caps[j], urls[j]) != 0) {
             fprintf(stderr, "multicam: capture[%d] 启动失败\n", j);
             goto out;
@@ -347,6 +355,7 @@ static int run(const multicam_config_t *cfg)
                 if (w > 0) { ready++; continue; }
                 if (lane_g2r[j] && inst[j].restart_pending) continue;  /* 拨号失败待重建 */
                 if (!lane_g2r[j] && !cap_started[j]) continue;         /* 未配置源 */
+                if (cfg->cameras[cam_cfg[j]].external) continue;       /* 供外部播放，不占观看位 */
                 pending++;
             }
             if (ready == n || pending == 0) break;
@@ -383,8 +392,12 @@ static int run(const multicam_config_t *cfg)
             n_slots = 2;
             canvas_w = 800;
             canvas_h = tile_h;
-            fprintf(stderr, "multicam: 左右并排裁切（源 %dx%d，各裁 400x%d）→ 画布 %dx%d(5:3) @%dfps\n",
-                    src_w, src_h, tile_h, canvas_w, canvas_h, cfg->fps);
+            win_w = tile_w * cfg->squeeze_pct / 100;
+            if (win_w > src_w) win_w = src_w & ~1;
+            if (win_w < tile_w) win_w = tile_w;
+            fprintf(stderr, "multicam: 左右并排（源 %dx%d，压缩 %.2f×：每路取景 %dx%d → tile 400x%d）→ 画布 %dx%d(5:3) @%dfps\n",
+                    src_w, src_h, cfg->squeeze_pct / 100.0, win_w, tile_h, tile_h,
+                    canvas_w, canvas_h, cfg->fps);
         } else {
             tile_w = src_w;
             tile_h = src_h;
@@ -440,6 +453,8 @@ static int run(const multicam_config_t *cfg)
                 pst0.canvas_w = canvas_w; pst0.canvas_h = canvas_h;
                 pst0.tile_w = tile_w; pst0.tile_h = tile_h;
                 pst0.layout_cols = cols;
+                pst0.squeeze_pct = cfg->squeeze_pct;
+                pst0.win_w = win_w;
                 pst0.fps = cfg->fps; pst0.frames = frames;
                 pst0.session_failures = session_failures;
                 pst0.started_at = proc_start; pst0.n_slots = n_slots;
@@ -459,6 +474,8 @@ static int run(const multicam_config_t *cfg)
                     pst0.tiles[s].src_w = src_w;
                     pst0.tiles[s].src_h = src_h;
                     pst0.tiles[s].g2r_port = inst[owner].port;
+                    snprintf(pst0.tiles[s].g2r_user, sizeof(pst0.tiles[s].g2r_user), "%s", inst[owner].username);
+                    snprintf(pst0.tiles[s].g2r_pass, sizeof(pst0.tiles[s].g2r_pass), "%s", inst[owner].password);
                     pst0.tiles[s].g2r_rss_kb = (int)pid_rss_kb(inst[owner].pid);
                     pst0.tiles[s].g2r_alive = inst[owner].pid > 0;
                 }
@@ -502,6 +519,7 @@ static int run(const multicam_config_t *cfg)
                             char err[256];
                             if (!strncmp(chg_src, "rtsp://", 7)) {
                                 g->pid = 0;   /* 转直连形态 */
+                                cam->external = 0;   /* rtsp 源无实例可让位，归一化防自愈被跳过 */
                                 if (capture_start(&caps[owner], chg_src) == 0)
                                     cap_started[owner] = true;
                             } else {
@@ -511,7 +529,9 @@ static int run(const multicam_config_t *cfg)
                                     snprintf(urls[owner], sizeof(urls[owner]),
                                              "rtsp://%s:%s@127.0.0.1:%d/stream",
                                              g->username, g->password, g->port);
-                                    if (capture_start(&caps[owner], urls[owner]) == 0)
+                                    /* 供外部播放的路换源后也不拉流——观看位继续留给外部播放器 */
+                                    if (!cam->external &&
+                                        capture_start(&caps[owner], urls[owner]) == 0)
                                         cap_started[owner] = true;
                                 } else {
                                     fprintf(stderr, "multicam: 换源 g2r 启动失败: %s\n", err);
@@ -533,6 +553,7 @@ static int run(const multicam_config_t *cfg)
                 for (int s = 0; s < n_slots; s++) {
                     int owner = slot_owner[s];
                     if (owner < 0 || cap_started[owner]) continue;
+                    if (cfg->cameras[cam_cfg[owner]].external) continue;  /* 观看位已让出 */
                     const multicam_camera_t *c = &cfg->cameras[cam_cfg[owner]];
                     const char *pull;
                     if (!strncmp(c->source, "rtsp://", 7)) {
@@ -554,7 +575,9 @@ static int run(const multicam_config_t *cfg)
                     int64_t age = -1;
                     /* 置灰阈值联动 keyint：窗口解码下帧龄按 GOP 节拍增长 */
                     int64_t stale_limit = TILE_STALE_MS;
-                    if (owner >= 0) {
+                    if (owner >= 0 && cfg->cameras[cam_cfg[owner]].external) {
+                        /* 供外部播放：该路无捕获，画布保持置灰（note 见下） */
+                    } else if (owner >= 0) {
                         int64_t kit = capture_keyint_ms(&caps[owner]);
                         if (kit > 0 && kit * 2 + 500 > stale_limit) stale_limit = kit * 2 + 500;
                         int ox = (s % cols) * tile_w, oy = (s / cols) * tile_h;
@@ -563,26 +586,38 @@ static int run(const multicam_config_t *cfg)
                         uint8_t *v = u + (size_t)(canvas_w / 2) * (canvas_h / 2);
                         if (!strcmp(cfg->layout_type, "crop_1x2")) {
                             int cx = cfg->cameras[cam_cfg[owner]].crop_x;
-                            age = capture_paint_crop(&caps[owner], y, u, v,
-                                                     canvas_w, canvas_w / 2,
-                                                     cx, 0, tile_w, tile_h);
+                            if (cx < 0) cx = (src_w - win_w) / 2 & ~1;
+                            if (cx > src_w - win_w) cx = (src_w - win_w) & ~1;
+                            if (win_w != tile_w)
+                                age = capture_paint_squeeze(&caps[owner], y, u, v,
+                                                            canvas_w, canvas_w / 2,
+                                                            cx, 0, win_w, tile_h,
+                                                            tile_w, tile_h);
+                            else
+                                age = capture_paint_crop(&caps[owner], y, u, v,
+                                                         canvas_w, canvas_w / 2,
+                                                         cx, 0, tile_w, tile_h);
                         } else {
                             age = capture_paint_tile(&caps[owner], y, u, v,
                                                      canvas_w, canvas_w / 2, tile_w, tile_h);
                         }
                     }
                     if (age < 0 || age > stale_limit) {
+                        char want[64];
+                        snprintf(want, sizeof(want), "%s",
+                                 owner < 0 ? "该路未启用" :
+                                 cfg->cameras[cam_cfg[owner]].external ? "外部播放中（检测暂停）" :
+                                 cam_unconfigured(&cfg->cameras[cam_cfg[owner]]) ? "该路待配置" :
+                                 age == -2 ? "分辨率不符" :
+                                 age < 0 ? "无帧（拨号/解码未就绪）" : "断流超时");
                         if (!slot_gray[s]) {
                             fill_gray_tile(canvas, canvas_w, canvas_h, s, cols, tile_w, tile_h);
                             slot_gray[s] = true;
                             gray_since[s] = now0;
-                            snprintf(slot_note[s], sizeof(slot_note[s]), "%s",
-                                     owner < 0 ? "该路未启用" :
-                                     cam_unconfigured(&cfg->cameras[cam_cfg[owner]]) ? "该路待配置" :
-                                     age == -2 ? "分辨率不符" :
-                                     age < 0 ? "无帧（拨号/解码未就绪）" : "断流超时");
-                            fprintf(stderr, "multicam: tile %d 置灰（%s）\n", s, slot_note[s]);
+                            fprintf(stderr, "multicam: tile %d 置灰（%s）\n", s, want);
                         }
+                        if (strcmp(slot_note[s], want) != 0)
+                            snprintf(slot_note[s], sizeof(slot_note[s]), "%s", want);
                     } else if (slot_gray[s]) {
                         slot_gray[s] = false;
                         gray_since[s] = 0;
@@ -590,10 +625,12 @@ static int run(const multicam_config_t *cfg)
                     }
                 }
                 /* token 跟随：xiaomi 路的 tile 持续置灰超时 → 重建实例
-                   （g2r_start 重抽 mhcamera yaml 的最新 xiaomi 段，凭证复用） */
+                   （g2r_start 重抽 mhcamera yaml 的最新 xiaomi 段，凭证复用）。
+                   供外部播放的路除外——重建会掐断外部播放器的会话 */
                 for (int s = 0; s < n_slots; s++) {
                     int owner = slot_owner[s];
                     if (owner < 0 || !slot_gray[s] || !gray_since[s]) continue;
+                    if (cfg->cameras[cam_cfg[owner]].external) continue;
                     g2r_instance_t *g = &inst[owner];
                     if (g->pid <= 0 || !g->username[0]) continue; /* 直连路无实例 */
                     if (now0 - gray_since[s] < TILE_FORCE_RESTART_MS) continue;
@@ -627,6 +664,8 @@ static int run(const multicam_config_t *cfg)
                 pst.canvas_w = canvas_w; pst.canvas_h = canvas_h;
                 pst.tile_w = tile_w; pst.tile_h = tile_h;
                 pst.layout_cols = cols;
+                pst.squeeze_pct = cfg->squeeze_pct;
+                pst.win_w = win_w;
                 pst.fps = cfg->fps; pst.frames = frames;
                 pst.started_at = proc_start; pst.n_slots = n_slots;
                 for (int s = 0; s < n_slots; s++) {
@@ -646,6 +685,8 @@ static int run(const multicam_config_t *cfg)
                     pt->src_w = src_w;
                     pt->src_h = src_h;
                     pt->g2r_port = inst[owner].port;
+                    snprintf(pt->g2r_user, sizeof(pt->g2r_user), "%s", inst[owner].username);
+                    snprintf(pt->g2r_pass, sizeof(pt->g2r_pass), "%s", inst[owner].password);
                     pt->g2r_rss_kb = (int)pid_rss_kb(inst[owner].pid);
                     pt->g2r_alive = inst[owner].pid > 0;
                 }

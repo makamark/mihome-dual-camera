@@ -92,6 +92,8 @@ static int handle_status_get(ainice_bridge_response_t *response)
     cJSON_AddNumberToObject(s, "tile_w", st.tile_w);
     cJSON_AddNumberToObject(s, "tile_h", st.tile_h);
     cJSON_AddNumberToObject(s, "layout_cols", st.layout_cols);
+    cJSON_AddNumberToObject(s, "squeeze_pct", st.squeeze_pct);
+    cJSON_AddNumberToObject(s, "win_w", st.win_w);
     cJSON_AddNumberToObject(s, "fps", st.fps);
     /* 进程 RSS（statm 第 2 列 = 常驻页数；插件沙箱可读自己的 /proc/self） */
     {
@@ -121,6 +123,8 @@ static int handle_status_get(ainice_bridge_response_t *response)
         cJSON_AddNumberToObject(o, "src_w", t->src_w);
         cJSON_AddNumberToObject(o, "src_h", t->src_h);
         cJSON_AddNumberToObject(o, "g2r_port", t->g2r_port);
+        cJSON_AddStringToObject(o, "g2r_user", t->g2r_user);
+        cJSON_AddStringToObject(o, "g2r_pass", t->g2r_pass);
         cJSON_AddNumberToObject(o, "g2r_rss_kb", t->g2r_rss_kb);
         cJSON_AddBoolToObject(o, "g2r_alive", t->g2r_alive);
         cJSON_AddItemToArray(tiles, o);
@@ -313,6 +317,11 @@ static int handle_source_set(cJSON *params, ainice_bridge_response_t *response)
                 cJSON *s = cJSON_GetObjectItem(it, "source");
                 if (cJSON_IsString(s)) cJSON_SetValuestring(s, src);
                 else cJSON_AddStringToObject(it, "source", src);
+                /* rtsp 直连无 go2rtc 实例，清掉残留的 external（否则自愈/捕获被跳过） */
+                if (!strncmp(src, "rtsp://", 7)) {
+                    cJSON *ex = cJSON_GetObjectItem(it, "external");
+                    if (ex) cJSON_ReplaceItemInObject(it, "external", cJSON_CreateBool(false));
+                }
                 found = true;
                 break;
             }

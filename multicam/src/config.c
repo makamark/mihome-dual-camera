@@ -13,7 +13,7 @@
    并按默认运行（灰画布常驻），用户在面板选择设备/授权后即出画面。 */
 static const char *CONFIG_DEFAULT_JSON =
     "{\n"
-    "  \"layout\": { \"version\": 3, \"type\": \"crop_1x2\", \"tile\": [400, 480] },\n"
+    "  \"layout\": { \"version\": 3, \"type\": \"crop_1x2\", \"tile\": [400, 480], \"squeeze\": 1.0 },\n"
     "  \"output\": { \"fps\": 3, \"format\": \"yuv420p\" },\n"
     "  \"capture\": { \"window\": true, \"window_frames\": 4 },\n"
     "  \"go2rtc\": {\n"
@@ -53,7 +53,13 @@ static int config_parse(multicam_config_t *cfg, const char *buf)
             cfg->tile_w = cJSON_GetArrayItem(sub, 0)->valueint;
             cfg->tile_h = cJSON_GetArrayItem(sub, 1)->valueint;
         }
+        sub = cJSON_GetObjectItem(item, "squeeze");
+        if (cJSON_IsNumber(sub) && sub->valuedouble >= 1.0 && sub->valuedouble <= 2.5)
+            cfg->squeeze_pct = (int)(sub->valuedouble * 100 + 0.5);
     }
+    /* 横向压缩系数钳制（100=不压缩；上限 250，paint 时再按源宽收敛） */
+    if (cfg->squeeze_pct < 100) cfg->squeeze_pct = 100;
+    if (cfg->squeeze_pct > 250) cfg->squeeze_pct = 250;
     /* 默认使用 crop_1x2 左右并排裁切（400x480 × 2 = 800x480，精确匹配 5:3 模型输入） */
     if (!cfg->layout_type[0] || !strcmp(cfg->layout_type, "crop_1x2")) {
         snprintf(cfg->layout_type, sizeof(cfg->layout_type), "crop_1x2");
@@ -125,6 +131,11 @@ static int config_parse(multicam_config_t *cfg, const char *buf)
         cam->tile = cJSON_IsNumber(sub) ? sub->valueint : cfg->camera_count;
         sub = cJSON_GetObjectItem(it, "crop_x");
         cam->crop_x = cJSON_IsNumber(sub) ? sub->valueint : -1;
+        sub = cJSON_GetObjectItem(it, "external");
+        cam->external = cJSON_IsTrue(sub);
+        /* external 只对米家路有意义（让出 go2rtc 实例的 RTSP 观看位）；
+           rtsp 直连路无实例，残留的 external 会让启动捕获/自愈被跳过（永久灰） */
+        if (!strncmp(cam->source, "rtsp://", 7)) cam->external = 0;
         sub = cJSON_GetObjectItem(it, "enabled");
         cam->enabled = !cJSON_IsBool(sub) || cJSON_IsTrue(sub);
         if (cam->tile + 1 > canvas_w) canvas_w = cam->tile + 1;

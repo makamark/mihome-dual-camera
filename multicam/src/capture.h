@@ -76,6 +76,18 @@ int64_t capture_paint_crop(capture_t *cap, uint8_t *dst_y, uint8_t *dst_u, uint8
                            int crop_x, int crop_y,
                            int crop_w, int crop_h);
 
+/* 横向压缩取景（crop_1x2 + squeeze>1）：把源画面 (crop_x, crop_y) 起的
+   win_w×win_h 窗口水平双线性缩放成 out_w×out_h tile（垂直 1:1 拷贝行）。
+   窗口比 tile 宽 → 画面横向压缩（人变瘦）、实际取景覆盖更宽，画布几何不变。
+   窗口宽于源画面时收敛为整幅（覆盖全宽，实际压缩比降低）。
+   crop_x < 0 自动居中；win_w/out_w 须为偶数；out_h 须等于 win_h。
+   返回帧龄毫秒；无帧 -1；高度不足/参数非法 -2；out_w 超上限 -3。 */
+int64_t capture_paint_squeeze(capture_t *cap, uint8_t *dst_y, uint8_t *dst_u, uint8_t *dst_v,
+                              int dst_y_stride, int dst_c_stride,
+                              int crop_x, int crop_y,
+                              int win_w, int win_h,
+                              int out_w, int out_h);
+
 /* 取景器快照：把当前槽位全幅帧编码成一帧 JPEG（面板拖动取景框用）。
    编码器懒初始化常驻（每路一个，仅 bridge 线程串行调用）。
    返回 JPEG 字节数；无帧 -1；输出缓冲不足 -2。 */
