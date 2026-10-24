@@ -63,14 +63,29 @@ function devIp(dev) {
   const m2 = /ip: ([0-9.]+)/.exec(dev.info || "");
   return m2 ? m2[1] : "";
 }
-function sourceFor(dev, acct) {
+/* 米家源 URL（对齐 mhcamera v1.0.9）：不强制 transport=tcp——go2rtc 会同时通告
+   UDP/TCP、跟随摄像头应答（强制 TCP 会弄坏只应答 UDP 的摄像头） */
+function sourceFor(dev, acct, chan) {
+  const ch = chan === 2 ? "&channel=2" : "";
   if (dev.url && dev.url.startsWith("xiaomi://"))
-    return dev.url + "&subtype=1&audio=0&transport=tcp";
-  return `xiaomi://${acct}:cn@${devIp(dev)}?did=${dev.id}&model=${dev.model}&subtype=1&audio=0&transport=tcp`;
+    return dev.url + ch + "&subtype=1&audio=0";
+  return `xiaomi://${acct}:cn@${devIp(dev)}?did=${dev.id}&model=${dev.model}${ch}&subtype=1&audio=0`;
 }
 function camDid(c) {
   const m = /did=(\d+)/.exec(c.source || "");
   return m ? m[1] : "";
+}
+/* 双目画面（对齐 mhcamera）：画面 1 = 源不带 channel（主镜头），
+   画面 2 = 源加 channel=2（go2rtc CS2 命令填 videoquality2 选副镜头） */
+function channelOf(src) {
+  const m = /[?&]channel=(\d+)/.exec(String(src || ""));
+  return m && Number(m[1]) > 1 ? 2 : 1;
+}
+function withChannel(src, chan) {
+  let s = String(src || "");
+  s = s.replace(/([?&])channel=\d+&/g, "$1").replace(/[?&]channel=\d+$/g, "");
+  if (chan !== 2) return s;
+  return s + (s.includes("?") ? "&" : "?") + "channel=2";
 }
 function nSlots() {
   let m = 1;
@@ -82,15 +97,24 @@ function nSlots() {
 function camLabel(slot) {
   const c = (state.cfg && state.cfg.cameras || []).find(c => (c.tile || 0) === slot);
   if (!c) return "摄像头 " + (slot + 1);
-  if (c.name) return c.name;
-  const src = String(c.source || "");
-  if (src.startsWith("rtsp://")) {
-    const m = /@([0-9.]+)[:/?]/.exec(src) || /^rtsp:\/\/([0-9.]+)/.exec(src);
-    return m ? "自行接入 " + m[1] : "自行接入";
-  }
-  const did = camDid(c);
-  const dev = (state.devices || []).find(d => String(d.id) === did);
-  return dev ? dev.name : (c.id || "摄像头 " + (slot + 1));
+  const ch2 = channelOf(c.source) === 2;
+  const base = (() => {
+    if (c.name) return c.name;
+    const src = String(c.source || "");
+    if (src.startsWith("rtsp://")) {
+      const m = /@([0-9.]+)[:/?]/.exec(src) || /^rtsp:\/\/([0-9.]+)/.exec(src);
+      return m ? "自行接入 " + m[1] : "自行接入";
+    }
+    const did = camDid(c);
+    const dev = (state.devices || []).find(d => String(d.id) === did);
+    if (dev) return dev.name;
+    if (src.startsWith("xiaomi://")) {
+      const m = /@([0-9.]+)\?/.exec(src);
+      return m ? "小米摄像头 " + m[1] : "小米摄像头";
+    }
+    return c.id || "摄像头 " + (slot + 1);
+  })();
+  return ch2 ? base + " · 画面 2" : base;
 }
 function renderStatus() {
   const s = state.status;
@@ -122,12 +146,16 @@ function renderStatus() {
 /* 取景器状态（每 tile 一份）：img=最新原画快照、x=框位置、busy 防重入。
    renderCameras 重跑（选机/刷新目录）时保留 img，画面不闪。 */
 const framers = {};
-/* 接入方式（每路）：米家 / 自行接入（rtsp:// 直连，无需米家授权）。
+/* 接入方式（每路）：米家 / 自行接入（rtsp:// 直连或 xiaomi:// 小米链接）。
    编辑态与输入草稿存模块级，renderCameras 重跑（加载设备目录）时不丢。 */
-const camModes = {}, srcDrafts = {};
+const camModes = {}, srcDrafts = {}, chanDrafts = {};
 function modeOf(cam) {
   return camModes[cam.tile]
     || (String(cam.source || "").startsWith("rtsp://") ? "rtsp" : "xiaomi");
+}
+function chanOf(cam) {
+  if (chanDrafts[cam.tile] != null) return chanDrafts[cam.tile];
+  return channelOf(cam.source);
 }
 function drawFramer(tile) {
   const f = framers[tile];
@@ -202,12 +230,18 @@ function renderCameras() {
         </div>
       </div>
       <div class="src-row">
-        <select class="dev">
-          <option value="" ${did ? "" : "selected"}>选择米家设备…</option>
-          ${opts}
-        </select>
+        <div class="mi-part">
+          <select class="dev">
+            <option value="" ${did ? "" : "selected"}>选择米家设备…</option>
+            ${opts}
+          </select>
+          <div class="chanseg" role="group" aria-label="摄像头画面" title="双目摄像头选择画面；切换即生效">
+            <button type="button" class="cseg" data-ch="1">画面 1</button>
+            <button type="button" class="cseg" data-ch="2">画面 2</button>
+          </div>
+        </div>
         <div class="rtsp-part">
-          <input class="src" type="text" placeholder="rtsp://账号:密码@摄像头地址:554/路径" value="${srcVal.replace(/"/g, "&quot;")}" spellcheck="false">
+          <input class="src" type="text" placeholder="rtsp://… 或 xiaomi://账号:cn@IP?did=设备ID" value="${srcVal.replace(/"/g, "&quot;")}" spellcheck="false">
           <button type="button" class="btn micro src-go">连接</button>
         </div>
       </div>
@@ -269,23 +303,69 @@ function renderCameras() {
         await call("multicam", "source.set", { tile, source: src }, 10000);
         $("save-msg").textContent = `${name}已切换，画面刷新中…`;
         setTimeout(() => refreshFramer(tile), 4000);
+        return true;
       } catch (e) {
         $("save-msg").textContent = `${name}切换失败：${e.message}`;
+        return false;
       }
     }
+    /* 双目画面切换：热切换（URL 增删 channel=2），无需保存；未选设备时先记住选择 */
+    const chanSegs = card.querySelectorAll(".chanseg .cseg");
+    function setChanUI(ch) {
+      chanSegs.forEach(x => x.classList.toggle("active", +x.dataset.ch === ch));
+    }
+    chanSegs.forEach(x => { x.disabled = !did; });
+    setChanUI(chanOf(cam));
+    chanSegs.forEach(b => {
+      b.onclick = () => {
+        const ch = +b.dataset.ch;
+        if (ch === chanOf(cam)) return;
+        chanDrafts[cam.tile] = ch;
+        setChanUI(ch);
+        const src = String(cam.source || "");
+        if (/^xiaomi:\/\/\S+[?&]did=\d+/.test(src)) {
+          cam.source = withChannel(src, ch);
+          applySource(cam.tile, cam.source, ch === 2 ? "画面 2" : "画面 1");
+        }
+      };
+    });
     card.querySelector(".dev").onchange = e => {
       const dev = state.devices.find(d => String(d.id) === e.target.value);
       if (!dev) return;
-      cam.source = sourceFor(dev, acct);
+      chanDrafts[cam.tile] = 1;   /* 换设备回到画面 1（mhcamera 同款语义） */
+      setChanUI(1);
+      cam.source = sourceFor(dev, acct, 1);
       cam.did = String(dev.id); cam.name = dev.name; cam.model = dev.model; cam.localip = dev.localip;
       applySource(cam.tile, cam.source, dev.name || dev.id);
     };
-    /* 自行接入：填 rtsp:// 地址，回车/失焦或点「连接」即生效 */
-    function applyRtsp() {
+    /* 自行接入：rtsp:// 地址或 xiaomi:// 小米链接，回车/失焦或点「连接」即生效 */
+    function applyDirect() {
       const v = card.querySelector(".src").value.trim();
       srcDrafts[cam.tile] = v;
+      if (/^xiaomi:\/\//.test(v)) {
+        if (!/^[^?]*[?&]did=\d+/.test(v)) {
+          $("save-msg").textContent = "小米链接需包含 did= 参数（xiaomi://账号:cn@IP?did=设备ID）";
+          return;
+        }
+        /* 补齐缺省参数（与米家路一致），model/channel 等其余参数保持原样 */
+        let s = v;
+        if (!/[?&]subtype=/.test(s)) s += (s.includes("?") ? "&" : "?") + "subtype=1";
+        if (!/[?&]audio=/.test(s)) s += "&audio=0";
+        cam.source = s;
+        cam.did = (/[?&]did=(\d+)/.exec(s) || [])[1] || "";
+        const dev = state.devices.find(d => String(d.id) === cam.did);
+        cam.name = ""; cam.model = dev ? dev.model : ""; cam.localip = dev ? dev.localip : "";
+        const ok = await applySource(cam.tile, s, null);
+        if (ok) {
+          /* 小米链接本质是米家源：卡片落回米家形态（设备下拉按 did 预选，画面切换可用） */
+          camModes[cam.tile] = "xiaomi";
+          srcDrafts[cam.tile] = "";
+          renderCameras();
+        }
+        return;
+      }
       if (!/^rtsp:\/\/\S+/.test(v)) {
-        $("save-msg").textContent = "请填写 rtsp:// 开头的摄像头地址";
+        $("save-msg").textContent = "请填写 rtsp:// 或 xiaomi:// 开头的地址";
         return;
       }
       cam.source = v;
@@ -294,8 +374,8 @@ function renderCameras() {
       cam.external = false;   /* rtsp 直连无实例可让位，归一化（后端落盘同样会清） */
       applySource(cam.tile, v, null);
     }
-    card.querySelector(".src").onchange = applyRtsp;
-    card.querySelector(".src-go").onclick = applyRtsp;
+    card.querySelector(".src").onchange = applyDirect;
+    card.querySelector(".src-go").onclick = applyDirect;
 
     const slider = card.querySelector(".crop-slider");
     const valLabel = card.querySelector(".crop-val");

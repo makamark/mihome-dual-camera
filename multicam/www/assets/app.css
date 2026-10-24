@@ -86,10 +86,16 @@ details.fold[open] summary::after { transform: rotate(-90deg); }
 .modeseg .seg { font: inherit; font-size: 12px; padding: 3px 12px; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
 .modeseg .seg.active { background: var(--primary); color: #fff; }
 .src-row { margin-top: 8px; }
-.src-row .dev { width: 100%; }
+.src-row .mi-part { display: flex; gap: 6px; align-items: center; }
+.src-row .mi-part .dev { flex: 1; min-width: 0; width: 100%; }
+/* 双目画面切换（画面 1 / 画面 2）——风格同接入方式分段按钮 */
+.src-row .chanseg { display: inline-flex; flex-shrink: 0; border: 1px solid var(--line); border-radius: 99px; background: var(--bg); overflow: hidden; }
+.src-row .chanseg .cseg { font: inherit; font-size: 12px; padding: 3px 10px; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+.src-row .chanseg .cseg.active { background: var(--primary); color: #fff; }
+.src-row .chanseg .cseg:disabled { opacity: .45; cursor: not-allowed; }
 .src-row .rtsp-part { display: none; gap: 6px; align-items: center; }
 .src-row .rtsp-part .src { flex: 1; min-width: 0; }
-.cam-card.mode-rtsp .src-row .dev { display: none; }
+.cam-card.mode-rtsp .src-row .mi-part { display: none; }
 .cam-card.mode-rtsp .src-row .rtsp-part { display: flex; }
 
 /* 取景器 */
