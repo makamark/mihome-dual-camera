@@ -97,7 +97,9 @@ static void default_config_path(char *out, size_t cap)
 }
 
 /* 全新安装时数据目录可能不存在（导入只装程序不建运行目录）；
-   tmp/ 供 go2rtc 实例 socket/日志与授权服务使用，缺失会让授权与实例全挂 */
+   tmp/ 供 go2rtc 实例 socket/日志与授权服务使用，缺失会让授权与实例全挂。
+   tmp 必须严格 0700：go2rtc 的 AIV1 media socket 服务端校验目录私有性
+   （0700 + 属主一致），0755 会被拒听导致实例起不来。 */
 static void ensure_data_dirs(void)
 {
     const char *data = getenv("AINICE_PLUGIN_DATA");
@@ -106,8 +108,10 @@ static void ensure_data_dirs(void)
     if (mkdir(data, 0755) == 0)
         fprintf(stderr, "multicam: 创建数据目录 %s\n", data);
     snprintf(p, sizeof(p), "%s/tmp", data);
-    if (mkdir(p, 0755) == 0)
+    if (mkdir(p, 0700) == 0)
         fprintf(stderr, "multicam: 创建运行目录 %s\n", p);
+    else if (chmod(p, 0700) != 0)
+        fprintf(stderr, "multicam: ⚠ tmp 目录 chmod 0700 失败（AIV1 socket 可能被拒）\n");
 }
 
 static int set_input_mode_bitstream(void)
@@ -304,6 +308,7 @@ static int run(const multicam_config_t *cfg)
         snprintf(g->data_dir, sizeof(g->data_dir), "%s", cfg->data_dir);
         snprintf(g->g2r_bin, sizeof(g->g2r_bin), "%s", cfg->g2r_bin);
         snprintf(g->mh_yaml, sizeof(g->mh_yaml), "%s", cfg->mh_yaml);
+        g2r_media_sock_path(cfg->data_dir, j, g->media_path, sizeof(g->media_path));
 
         char err[256];
         if (g2r_start(g, err, sizeof(err)) != 0) {
@@ -321,12 +326,15 @@ static int run(const multicam_config_t *cfg)
     }
 
     for (int j = 0; j < n; j++) {
-        if (cap_started[j] || !urls[j][0]) continue;   /* 未配置路无 pull 地址 */
-        /* 供外部播放：实例照跑（RTSP 输出可用），但本插件不拉流——
-           厂商 RTSP 输出单观看者，观看位让给外部播放器 */
-        if (cfg->cameras[cam_cfg[j]].external) {
-            fprintf(stderr, "multicam: cam[%d](%s) tile %d 供外部播放，跳过捕获（该路检测暂停）\n",
-                    cam_cfg[j], cfg->cameras[cam_cfg[j]].id, cam_tile[j]);
+        if (cap_started[j] || !urls[j][0]) continue;   /* 未配置路无拉流 */
+        /* 米家路走 AIV1（unix socket 直消费，不占 RTSP 观看位——外部播放
+           与检测并存）；rtsp 直连路照旧 ffmpeg 拉 RTSP */
+        if (lane_g2r[j]) {
+            if (capture_start_aiv1(&caps[j], inst[j].media_path, &inst[j].pid) != 0) {
+                fprintf(stderr, "multicam: capture[%d] AIV1 启动失败\n", j);
+                goto out;
+            }
+            cap_started[j] = true;
             continue;
         }
         if (capture_start(&caps[j], urls[j]) != 0) {
@@ -358,7 +366,6 @@ static int run(const multicam_config_t *cfg)
                 if (w > 0) { ready++; continue; }
                 if (lane_g2r[j] && inst[j].restart_pending) continue;  /* 拨号失败待重建 */
                 if (!lane_g2r[j] && !cap_started[j]) continue;         /* 未配置源 */
-                if (cfg->cameras[cam_cfg[j]].external) continue;       /* 供外部播放，不占观看位 */
                 pending++;
             }
             if (ready == n || pending == 0) break;
@@ -481,6 +488,7 @@ static int run(const multicam_config_t *cfg)
                     snprintf(pst0.tiles[s].g2r_pass, sizeof(pst0.tiles[s].g2r_pass), "%s", inst[owner].password);
                     pst0.tiles[s].g2r_rss_kb = (int)pid_rss_kb(inst[owner].pid);
                     pst0.tiles[s].g2r_alive = inst[owner].pid > 0;
+                    pst0.tiles[s].aiv1 = lane_g2r[owner];
                 }
                 panel_status_publish(&pst0);
                 usleep(delay * 1000 * 1000);
@@ -522,7 +530,6 @@ static int run(const multicam_config_t *cfg)
                             char err[256];
                             if (!strncmp(chg_src, "rtsp://", 7)) {
                                 g->pid = 0;   /* 转直连形态 */
-                                cam->external = 0;   /* rtsp 源无实例可让位，归一化防自愈被跳过 */
                                 if (capture_start(&caps[owner], chg_src) == 0)
                                     cap_started[owner] = true;
                             } else {
@@ -532,9 +539,7 @@ static int run(const multicam_config_t *cfg)
                                     snprintf(urls[owner], sizeof(urls[owner]),
                                              "rtsp://%s:%s@127.0.0.1:%d/stream",
                                              g->username, g->password, g->port);
-                                    /* 供外部播放的路换源后也不拉流——观看位继续留给外部播放器 */
-                                    if (!cam->external &&
-                                        capture_start(&caps[owner], urls[owner]) == 0)
+                                    if (capture_start_aiv1(&caps[owner], g->media_path, &g->pid) == 0)
                                         cap_started[owner] = true;
                                 } else {
                                     fprintf(stderr, "multicam: 换源 g2r 启动失败: %s\n", err);
@@ -552,25 +557,21 @@ static int run(const multicam_config_t *cfg)
 
                 /* 自愈：换源失败/启动失败导致捕获缺失的启用路，重试 capture_start。
                    capture 线程内部自带断流重连，这里只补"线程不存在"的洞；
-                   xiaomi 路须等 go2rtc 实例就绪（watcher 负责重建）。 */
+                   xiaomi 路 AIV1 连接失败会自旋重试（等 watcher 重建实例），
+                   rtsp 直连路才需要这里补线程。 */
                 for (int s = 0; s < n_slots; s++) {
                     int owner = slot_owner[s];
                     if (owner < 0 || cap_started[owner]) continue;
-                    if (cfg->cameras[cam_cfg[owner]].external) continue;  /* 观看位已让出 */
                     const multicam_camera_t *c = &cfg->cameras[cam_cfg[owner]];
-                    const char *pull;
                     if (!strncmp(c->source, "rtsp://", 7)) {
-                        pull = c->source;
-                    } else {
-                        g2r_instance_t *g = &inst[owner];
-                        if (g->pid <= 0 || !g->username[0]) continue;
-                        snprintf(urls[owner], sizeof(urls[owner]),
-                                 "rtsp://%s:%s@127.0.0.1:%d/stream",
-                                 g->username, g->password, g->port);
-                        pull = urls[owner];
+                        if (capture_start(&caps[owner], c->source) == 0)
+                            cap_started[owner] = true;
+                        continue;
                     }
-                    fprintf(stderr, "multicam: capture[%d] 自愈重启\n", owner);
-                    if (capture_start(&caps[owner], pull) == 0)
+                    g2r_instance_t *g = &inst[owner];
+                    if (g->pid <= 0 || !g->username[0]) continue;  /* 等 watcher 重建实例 */
+                    fprintf(stderr, "multicam: capture[%d] 自愈重启（AIV1）\n", owner);
+                    if (capture_start_aiv1(&caps[owner], g->media_path, &g->pid) == 0)
                         cap_started[owner] = true;
                 }
                 for (int s = 0; s < n_slots; s++) {
@@ -578,9 +579,7 @@ static int run(const multicam_config_t *cfg)
                     int64_t age = -1;
                     /* 置灰阈值联动 keyint：窗口解码下帧龄按 GOP 节拍增长 */
                     int64_t stale_limit = TILE_STALE_MS;
-                    if (owner >= 0 && cfg->cameras[cam_cfg[owner]].external) {
-                        /* 供外部播放：该路无捕获，画布保持置灰（note 见下） */
-                    } else if (owner >= 0) {
+                    if (owner >= 0) {
                         int64_t kit = capture_keyint_ms(&caps[owner]);
                         if (kit > 0 && kit * 2 + 500 > stale_limit) stale_limit = kit * 2 + 500;
                         int ox = (s % cols) * tile_w, oy = (s / cols) * tile_h;
@@ -609,7 +608,6 @@ static int run(const multicam_config_t *cfg)
                         char want[64];
                         snprintf(want, sizeof(want), "%s",
                                  owner < 0 ? "该路未启用" :
-                                 cfg->cameras[cam_cfg[owner]].external ? "外部播放中（检测暂停）" :
                                  cam_unconfigured(&cfg->cameras[cam_cfg[owner]]) ? "该路待配置" :
                                  age == -2 ? "分辨率不符" :
                                  age < 0 ? "无帧（拨号/解码未就绪）" : "断流超时");
@@ -629,11 +627,10 @@ static int run(const multicam_config_t *cfg)
                 }
                 /* token 跟随：xiaomi 路的 tile 持续置灰超时 → 重建实例
                    （g2r_start 重抽 mhcamera yaml 的最新 xiaomi 段，凭证复用）。
-                   供外部播放的路除外——重建会掐断外部播放器的会话 */
+                   AIV1 消费端不占 RTSP 观看位，重建只影响检测通路。 */
                 for (int s = 0; s < n_slots; s++) {
                     int owner = slot_owner[s];
                     if (owner < 0 || !slot_gray[s] || !gray_since[s]) continue;
-                    if (cfg->cameras[cam_cfg[owner]].external) continue;
                     g2r_instance_t *g = &inst[owner];
                     if (g->pid <= 0 || !g->username[0]) continue; /* 直连路无实例 */
                     if (now0 - gray_since[s] < TILE_FORCE_RESTART_MS) continue;
@@ -692,6 +689,7 @@ static int run(const multicam_config_t *cfg)
                     snprintf(pt->g2r_pass, sizeof(pt->g2r_pass), "%s", inst[owner].password);
                     pt->g2r_rss_kb = (int)pid_rss_kb(inst[owner].pid);
                     pt->g2r_alive = inst[owner].pid > 0;
+                    pt->aiv1 = lane_g2r[owner];
                 }
                 panel_status_publish(&pst);
                 uint64_t now = now_us();

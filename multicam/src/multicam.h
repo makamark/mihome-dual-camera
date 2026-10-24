@@ -12,9 +12,9 @@ typedef struct {
     int tile;
     int crop_x;           /* 水平裁切起点（0..src_w-取景宽，-1 表示自动居中） */
     int enabled;
-    int external;         /* 供外部播放：go2rtc 实例照跑但本插件不拉流（厂商
-                             RTSP 输出为单观看者，让出唯一观看位给外部播放器），
-                             该路置灰暂停检测 */
+    int external;         /* 已废弃（0.7.0 起检测走 AIV1 直消费，不再占用
+                             RTSP 观看位，检测与外部播放并存）。仅为旧配置
+                             兼容保留解析，运行期恒为 0、不参与任何逻辑 */
     char source[256];
 } multicam_camera_t;
 

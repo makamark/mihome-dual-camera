@@ -25,6 +25,7 @@ typedef struct {
     bool g2r_alive;
     int crop_x;           /* 当前水平裁切起点 */
     int src_w, src_h;     /* 源画面原始分辨率 */
+    bool aiv1;            /* 输入通路：true=AIV1 直消费（米家路），false=RTSP 直连 */
 } panel_tile_t;
 
 typedef struct {

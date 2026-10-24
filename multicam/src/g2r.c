@@ -141,16 +141,31 @@ static bool json_str(const char *json, const char *field, char *out, size_t cap)
     return true;
 }
 
-/* camera 模块的 RTSP 监听端口是常量字符串 "video:8554"（rodata）。
-   逐实例补丁成 video:855{4+i}（最多 6 路：8554..8559），写入 tmp 副本后 exec。
-   公开版供 auth 实例（index 9 / 端口 8559）复用。 */
+/* camera 模块的两处 rodata 常量逐实例补丁：
+   1) RTSP 监听 "video:8554" → "video:855{4+i}"（最多 6 路：8554..8559）
+   2) AIV1 media socket 路径 "/data/plugins/mhcamera/tmp/go2rtc-media.sock"
+      → "<data_dir>/tmp/media-aiv1-<i>.sock"——等长字节替换（Go 字符串长度
+      立即数固定 44），多实例各听各的 socket，且不再依赖 mhcamera 的数据目录。
+   补丁副本写 tmp 后 exec；公开版供 auth/disc 实例（index 8/9）复用。 */
+
+void g2r_media_sock_path(const char *data_dir, int index, char *out, size_t cap)
+{
+    snprintf(out, cap, "%s/tmp/media-aiv1-%d.sock", data_dir, index);
+}
+
 int g2r_make_patched_bin(const char *g2r_bin, int port, const char *data_dir,
                          int index, char *tmp_out, size_t tmp_cap,
                          char *err, size_t err_cap)
 {
-    /* 端口 8554 是原始常量，直接使用原始二进制，无需复制！
-       避免在仅 32MB 的 /data 分区重复写入 8.3MB 大文件导致存储耗尽 */
-    if (port == 8554) {
+    static const char media_orig[] = "/data/plugins/mhcamera/tmp/go2rtc-media.sock";
+    char media_repl[160];
+    g2r_media_sock_path(data_dir, index, media_repl, sizeof(media_repl));
+    bool media_patch_ok = strlen(media_repl) == sizeof(media_orig) - 1;
+    bool port_patch = port != 8554;
+
+    /* 端口 8554 且 media 路径不等长（非标准 data_dir，如开发容器）：
+       无需补丁，直接使用原始二进制，避免 8.3MB 大文件重复写入紧张的数据分区 */
+    if (!port_patch && !media_patch_ok) {
         snprintf(tmp_out, tmp_cap, "%s", g2r_bin);
         return 0;
     }
@@ -169,14 +184,27 @@ int g2r_make_patched_bin(const char *g2r_bin, int port, const char *data_dir,
     }
     fclose(in);
 
-    const unsigned char pat[] = "video:8554";
-    char repl[16];
-    snprintf(repl, sizeof(repl), "video:%d", port);
-    int count = 0;
-    for (size_t i = 0; i + sizeof(pat) <= (size_t)sz; i++) {
-        if (memcmp(buf + i, pat, sizeof(pat) - 1) == 0 && strlen(repl) == sizeof(pat) - 1) {
-            memcpy(buf + i, repl, strlen(repl));
-            count++;
+    int count_port = 0, count_media = 0;
+    if (port_patch) {
+        const unsigned char pat[] = "video:8554";
+        char repl[16];
+        snprintf(repl, sizeof(repl), "video:%d", port);
+        if (strlen(repl) == sizeof(pat) - 1) {
+            for (size_t i = 0; i + sizeof(pat) <= (size_t)sz; i++) {
+                if (memcmp(buf + i, pat, sizeof(pat) - 1) == 0) {
+                    memcpy(buf + i, repl, strlen(repl));
+                    count_port++;
+                }
+            }
+        }
+    }
+    if (media_patch_ok) {
+        const size_t n = sizeof(media_orig) - 1;
+        for (size_t i = 0; i + n <= (size_t)sz; i++) {
+            if (memcmp(buf + i, media_orig, n) == 0) {
+                memcpy(buf + i, media_repl, n);
+                count_media++;
+            }
         }
     }
     char tmp_bin[512];
@@ -192,9 +220,15 @@ int g2r_make_patched_bin(const char *g2r_bin, int port, const char *data_dir,
     fclose(ou);
     free(buf);
     chmod(tmp_bin, 0755);
-    if (count == 0) {
-        /* 兼容未来修复了端口硬编码的版本：原样使用 */
-        snprintf(tmp_bin, sizeof(tmp_bin), "%s", g2r_bin);
+    fprintf(stderr, "multicam: 补丁副本 p%d（port×%d media×%d）\n", index, count_port, count_media);
+    if (count_port == 0 && port_patch) {
+        /* 兼容未来修复了端口硬编码的版本：仍需 media 补丁时副本照用 */
+        fprintf(stderr, "multicam: ⚠ 未找到端口常量（未来版二进制？）\n");
+    }
+    if (media_patch_ok && count_media == 0) {
+        /* 无 media 常量（未来版本改为可配置）：路径按原样，消费端连不上会
+           在 capture 层报错回落置灰，不影响 RTSP 路径 */
+        fprintf(stderr, "multicam: ⚠ 未找到 media socket 路径常量\n");
     }
     snprintf(tmp_out, tmp_cap, "%s", tmp_bin);
     return 0;
@@ -390,6 +424,9 @@ void g2r_stop(g2r_instance_t *inst)
     char sock[512];
     snprintf(sock, sizeof(sock), "%s/tmp/g2r-%d.sock", inst->data_dir, inst->index);
     unlink(sock);
+    char media[160];
+    g2r_media_sock_path(inst->data_dir, inst->index, media, sizeof(media));
+    unlink(media);
     if (inst->tmp_bin[0] && strcmp(inst->tmp_bin, inst->g2r_bin) != 0)
         unlink(inst->tmp_bin);
     inst->running = false;

@@ -264,24 +264,12 @@ function renderCameras() {
         </div>
         <input type="range" class="crop-slider" min="0" max="${maxX}" step="2" value="${cropX}">
       </div>
-      <div class="rtsp-row" title="米家源同一时间只允许一个观看者：勾选「供外部播放」让出观看位后，外部播放器（VLC 等）才能连接；未勾选时该地址被插件自身占用">
+      <div class="rtsp-row" title="检测与外部播放并存（检测走内部通道，不占用此地址）；米家源同一时间只允许一个外部播放器连接">
         <span class="rtsp-label">取流地址</span>
         <input class="rtsp-url" type="text" readonly spellcheck="false" placeholder="运行后显示" data-tile="${cam.tile ?? i}">
         <button type="button" class="btn micro rtsp-copy">复制</button>
-      </div>
-      ${mode === "xiaomi" ? `
-      <div class="ext-row">
-        <label class="ext-lab"><input type="checkbox" class="cam-ext" ${cam.external ? "checked" : ""}> 供外部播放（暂停本路检测，地址可连接）</label>
-      </div>` : ""}`;
+      </div>`;
     card.querySelector(".cam-en").onchange = e => { cam.enabled = e.target.checked; markDirty(); };
-    const extCb = card.querySelector(".cam-ext");
-    if (extCb) extCb.onchange = e => {
-      cam.external = e.target.checked;
-      markDirty();
-      $("save-msg").textContent = e.target.checked
-        ? "保存后该路暂停检测，取流地址可供外部播放器使用"
-        : "保存后恢复该路检测";
-    };
     /* 接入方式切换：只切编辑视图，不改源——米家模式选中设备、自行接入点「连接」才真正换源生效 */
     card.querySelectorAll(".modeseg .seg").forEach(b => {
       b.classList.toggle("active", b.dataset.mode === mode);
@@ -371,7 +359,6 @@ function renderCameras() {
       cam.source = v;
       /* 清掉残留的米家设备元数据，状态芯片改按 rtsp 地址显示 */
       cam.name = ""; cam.did = ""; cam.model = ""; cam.localip = "";
-      cam.external = false;   /* rtsp 直连无实例可让位，归一化（后端落盘同样会清） */
       applySource(cam.tile, v, null);
     }
     card.querySelector(".src").onchange = applyDirect;

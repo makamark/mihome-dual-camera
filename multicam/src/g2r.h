@@ -17,6 +17,7 @@ typedef struct {
     char g2r_bin[256];      /* go2rtc 二进制路径 */
     char mh_yaml[256];      /* mhcamera 的 go2rtc.yaml（token 回退源） */
     char tmp_bin[512];      /* 端口补丁副本路径（停止时清理） */
+    char media_path[108];   /* AIV1 media socket 路径（逐实例补丁进二进制） */
     char username[32];
     char password[32];
 
@@ -36,10 +37,17 @@ int g2r_extract_tokens(const char *data_dir, int index, const char *mh_yaml,
    （原生授权 verify 成功后迁移 token 用）。 */
 int g2r_snapshot_tokens(const char *data_dir, const char *yaml_path);
 
-/* go2rtc 二进制端口补丁公开版（auth 实例复用，index=9 命名隔离）。 */
+/* go2rtc 二进制补丁公开版（auth 实例复用，index=9 命名隔离）。
+   逐实例替换两处 rodata 常量：RTSP 监听 "video:8554"→"video:<port>"，与
+   AIV1 media socket 路径 "/data/plugins/mhcamera/tmp/go2rtc-media.sock"（44B）
+   → "<data_dir>/tmp/media-aiv1-<i>.sock"（等长替换）。 */
 int g2r_make_patched_bin(const char *g2r_bin, int port, const char *data_dir,
                          int index, char *tmp_out, size_t tmp_cap,
                          char *err, size_t err_cap);
+
+/* 实例 AIV1 media socket 路径（capture 消费端与二进制补丁共用）。
+   注意：路径必须与二进制内的 44 字节常量等长（单数字下标恰好满足）。 */
+void g2r_media_sock_path(const char *data_dir, int index, char *out, size_t cap);
 
 /* 启动实例并等待源 running + RTSP enabled；返回 0 成功。
    失败时已尝试清理。err 输出可读原因。 */

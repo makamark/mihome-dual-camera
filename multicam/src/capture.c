@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "capture.h"
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -125,6 +126,64 @@ static int open_stream(capture_t *cap, AVFormatContext **fmt_out, AVCodecContext
     return 0;
 }
 
+/* GOP 窗口解码状态机（rtsp/aiv1 两输入路径共用，见 capture.h 注释） */
+static void window_step(capture_t *cap, bool is_key, AVCodecContext *dec)
+{
+    if (is_key) {
+        int64_t tm = now_ms();
+        if (cap->last_key_ms) {
+            int d = (int)(tm - cap->last_key_ms);
+            if (d > 100 && d < 20000)
+                cap->keyint_ms = cap->keyint_ms ? (cap->keyint_ms + d) / 2 : d;
+        }
+        cap->last_key_ms = tm;
+        cap->key_count++;
+        if (!cap->window_active && cap->window_enabled &&
+            cap->keyint_ms > 0 && cap->keyint_ms <= GOP_WINDOW_MAX_KEYINT_MS) {
+            cap->window_active = 1;
+            fprintf(stderr, "multicam: GOP 窗口解码启用（keyint≈%dms，每 GOP 解 %d 帧）\n",
+                    cap->keyint_ms, cap->window_frames);
+        }
+    }
+    if (!cap->window_enabled)
+        cap->window_active = 0; /* 标定旁路/配置关闭 → 恢复全解 */
+    if (cap->window_active) {
+        if (is_key) {
+            cap->burst_left = cap->window_frames;
+            dec->skip_frame = AVDISCARD_NONE;
+        } else if (cap->burst_left > 0) {
+            cap->burst_left--;
+            dec->skip_frame = AVDISCARD_NONE;
+        } else {
+            dec->skip_frame = AVDISCARD_NONKEY;
+            cap->skipped_pkts++;
+        }
+    } else {
+        dec->skip_frame = AVDISCARD_NONE;
+    }
+}
+
+/* 解码器取帧入槽（两输入路径共用）；返回 -1 解码器致命错误，0 正常 */
+static int drain_frames(capture_t *cap, AVCodecContext *dec, AVFrame *frm)
+{
+    int rc;
+    while ((rc = avcodec_receive_frame(dec, frm)) >= 0) {
+        if (frm->format == AV_PIX_FMT_YUV420P ||
+            frm->format == AV_PIX_FMT_YUVJ420P) {
+            slot_store(cap, frm);   /* yuvj420p 与 yuv420p 内存布局相同 */
+        } else {
+            if (frm->format != cap->warned_fmt) {
+                cap->warned_fmt = frm->format;
+                fprintf(stderr, "multicam: 像素格式 %s 不支持，帧被丢弃（本格式只告警一次）\n",
+                        av_get_pix_fmt_name((enum AVPixelFormat)frm->format));
+            }
+            cap->pixfmt_drops++;
+        }
+        av_frame_unref(frm);
+    }
+    return (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) ? 0 : -1;
+}
+
 static void *capture_thread(void *arg)
 {
     capture_t *cap = arg;
@@ -151,61 +210,11 @@ static void *capture_thread(void *arg)
             }
             if (pkt->stream_index != idx) { av_packet_unref(pkt); continue; }
 
-            /* ---- GOP 窗口解码状态机（见 capture.h 注释） ---- */
-            {
-                int is_key = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
-                if (is_key) {
-                    int64_t tm = now_ms();
-                    if (cap->last_key_ms) {
-                        int d = (int)(tm - cap->last_key_ms);
-                        if (d > 100 && d < 20000)
-                            cap->keyint_ms = cap->keyint_ms ? (cap->keyint_ms + d) / 2 : d;
-                    }
-                    cap->last_key_ms = tm;
-                    cap->key_count++;
-                    if (!cap->window_active && cap->window_enabled &&
-                        cap->keyint_ms > 0 && cap->keyint_ms <= GOP_WINDOW_MAX_KEYINT_MS) {
-                        cap->window_active = 1;
-                        fprintf(stderr, "multicam: GOP 窗口解码启用（keyint≈%dms，每 GOP 解 %d 帧）\n",
-                                cap->keyint_ms, cap->window_frames);
-                    }
-                }
-                if (!cap->window_enabled)
-                    cap->window_active = 0; /* 标定旁路/配置关闭 → 恢复全解 */
-                if (cap->window_active) {
-                    if (is_key) {
-                        cap->burst_left = cap->window_frames;
-                        dec->skip_frame = AVDISCARD_NONE;
-                    } else if (cap->burst_left > 0) {
-                        cap->burst_left--;
-                        dec->skip_frame = AVDISCARD_NONE;
-                    } else {
-                        dec->skip_frame = AVDISCARD_NONKEY;
-                        cap->skipped_pkts++;
-                    }
-                } else {
-                    dec->skip_frame = AVDISCARD_NONE;
-                }
-            }
+            window_step(cap, (pkt->flags & AV_PKT_FLAG_KEY) != 0, dec);
 
             rc = avcodec_send_packet(dec, pkt);
             if (rc < 0 && rc != AVERROR(EAGAIN)) alive = false;
-            while (rc >= 0) {
-                rc = avcodec_receive_frame(dec, frm);
-                if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
-                if (rc < 0) { alive = false; break; }
-                if (frm->format == AV_PIX_FMT_YUV420P ||
-                    frm->format == AV_PIX_FMT_YUVJ420P) {
-                    slot_store(cap, frm);   /* yuvj420p 与 yuv420p 内存布局相同 */
-                } else if (frm->format != cap->warned_fmt) {
-                    cap->warned_fmt = frm->format;
-                    fprintf(stderr, "multicam: 像素格式 %s 不支持，帧被丢弃（本格式只告警一次）\n",
-                            av_get_pix_fmt_name((enum AVPixelFormat)frm->format));
-                }
-                if (frm->format != AV_PIX_FMT_YUV420P && frm->format != AV_PIX_FMT_YUVJ420P)
-                    cap->pixfmt_drops++;
-                av_frame_unref(frm);
-            }
+            else if (rc >= 0 && drain_frames(cap, dec, frm) != 0) alive = false;
             av_packet_unref(pkt);
         }
         av_packet_free(&pkt);
@@ -220,12 +229,364 @@ static void *capture_thread(void *arg)
     return NULL;
 }
 
-int capture_start(capture_t *cap, const char *url)
+/* ---------- AIV1 输入模式：go2rtc 实例的 media socket 直消费 ----------
+   线协议 vendor 自 mhcamera（github.com/wade-hello/mhcamera，MIT）：
+   AIVH 握手（32B）→ AIVF 帧头（48B）+ AVCC 载荷（4 字节大端长度前缀 NAL）。
+   服务端逐字节一致于我们随包的 go2rtc 二进制（补丁 0002 哈希核对过），
+   且只接受"实例父进程"作为消费者（SO_PEERCRED pid == 实例 pid 的父）——
+   multicam 既是父进程又是消费者，天然通过。 */
+
+#include <errno.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+
+#define AIV1_VERSION          1u
+#define AIV1_HELLO_SIZE       32u
+#define AIV1_FRAME_HDR_SIZE   48u
+#define AIV1_MAX_PAYLOAD      (8u * 1024u * 1024u)
+#define AIV1_TIMESCALE        1000000u
+#define AIV1_CODEC_H264       1u
+#define AIV1_CODEC_H265       2u
+#define AIV1_FMT_AVCC         1u
+#define AIV1_FLAG_KEYFRAME    (1u << 0)
+#define AIV1_FLAG_DISCONT     (1u << 1)
+#define AIV1_NAL_H264_SPS     (1u << 0)
+#define AIV1_NAL_H264_PPS     (1u << 1)
+#define AIV1_NAL_H264_IDR     (1u << 2)
+#define AIV1_NAL_H264_SYNC    (AIV1_NAL_H264_SPS | AIV1_NAL_H264_PPS | AIV1_NAL_H264_IDR)
+#define AIV1_NAL_H265_VPS     (1u << 3)
+#define AIV1_NAL_H265_SPS     (1u << 4)
+#define AIV1_NAL_H265_PPS     (1u << 5)
+#define AIV1_NAL_H265_IRAP    (1u << 6)
+#define AIV1_NAL_H265_SYNC    (AIV1_NAL_H265_VPS | AIV1_NAL_H265_SPS | AIV1_NAL_H265_PPS | AIV1_NAL_H265_IRAP)
+#define AIV1_READ_TIMEOUT_S   10   /* 无帧超时：GOP≈3s，10s 无帧视为会话死亡 */
+
+static uint16_t aiv1_u16le(const uint8_t *d) { return (uint16_t)d[0] | (uint16_t)d[1] << 8; }
+static uint32_t aiv1_u32le(const uint8_t *d)
+{
+    return (uint32_t)d[0] | (uint32_t)d[1] << 8 | (uint32_t)d[2] << 16 | (uint32_t)d[3] << 24;
+}
+static uint64_t aiv1_u64le(const uint8_t *d)
+{
+    return (uint64_t)aiv1_u32le(d) | (uint64_t)aiv1_u32le(d + 4) << 32;
+}
+static uint32_t aiv1_u32be(const uint8_t *d)
+{
+    return (uint32_t)d[0] << 24 | (uint32_t)d[1] << 16 | (uint32_t)d[2] << 8 | d[3];
+}
+
+typedef struct {
+    uint32_t codec, max_payload;
+    uint64_t stream_epoch;
+} aiv1_hello_t;
+
+typedef struct {
+    uint32_t codec, flags;
+    uint64_t stream_epoch, output_seq, pts_us;
+    uint32_t payload_len;
+} aiv1_frame_t;
+
+static int aiv1_parse_hello(const uint8_t *d, size_t size, aiv1_hello_t *h)
+{
+    uint32_t codec, max_payload;
+    uint64_t epoch;
+    if (size != AIV1_HELLO_SIZE || memcmp(d, "AIVH", 4) != 0 ||
+        aiv1_u16le(d + 4) != AIV1_VERSION || aiv1_u16le(d + 6) != AIV1_HELLO_SIZE ||
+        aiv1_u32le(d + 12) != AIV1_FMT_AVCC || aiv1_u32le(d + 16) != AIV1_TIMESCALE)
+        return -1;
+    codec = aiv1_u32le(d + 8);
+    max_payload = aiv1_u32le(d + 20);
+    epoch = aiv1_u64le(d + 24);
+    /* 先校验后赋值：解析失败不污染调用方已持有的 hello（断线重连场景） */
+    if ((codec != AIV1_CODEC_H264 && codec != AIV1_CODEC_H265) ||
+        max_payload == 0 || max_payload > AIV1_MAX_PAYLOAD || epoch == 0)
+        return -1;
+    h->codec = codec;
+    h->max_payload = max_payload;
+    h->stream_epoch = epoch;
+    return 0;
+}
+
+static int aiv1_parse_frame(const uint8_t *d, size_t size,
+                            const aiv1_hello_t *h, aiv1_frame_t *f)
+{
+    if (size != AIV1_FRAME_HDR_SIZE || memcmp(d, "AIVF", 4) != 0 ||
+        aiv1_u16le(d + 4) != AIV1_VERSION || aiv1_u16le(d + 6) != AIV1_FRAME_HDR_SIZE ||
+        aiv1_u32le(d + 44) != 0)
+        return -1;
+    f->codec = aiv1_u32le(d + 8);
+    f->flags = aiv1_u32le(d + 12);
+    f->stream_epoch = aiv1_u64le(d + 16);
+    f->output_seq = aiv1_u64le(d + 24);
+    f->pts_us = aiv1_u64le(d + 32);
+    f->payload_len = aiv1_u32le(d + 40);
+    if (f->codec != h->codec ||
+        (f->flags & ~(AIV1_FLAG_KEYFRAME | AIV1_FLAG_DISCONT)) != 0 ||
+        f->stream_epoch != h->stream_epoch || f->output_seq == 0 ||
+        f->payload_len == 0 || f->payload_len > h->max_payload)
+        return -1;
+    return 0;
+}
+
+/* AVCC 结构校验 + 关键帧 NAL 识别（VPS/SPS/PPS/IRAP 齐全才算完整同步帧） */
+static int aiv1_avcc_inspect(uint32_t codec, const uint8_t *d, size_t size, unsigned *nal_flags)
+{
+    size_t off = 0;
+    unsigned flags = 0;
+    if (!d || !nal_flags || size == 0 ||
+        (codec != AIV1_CODEC_H264 && codec != AIV1_CODEC_H265)) return -1;
+    while (off < size) {
+        uint32_t n;
+        if (size - off < 4) return -1;
+        n = aiv1_u32be(d + off);
+        if (n == 0 || n > size - off - 4 ||
+            (codec == AIV1_CODEC_H265 && n < 2)) return -1;
+        if (codec == AIV1_CODEC_H264) {
+            uint32_t t = d[off + 4] & 0x1f;
+            if (t == 7) flags |= AIV1_NAL_H264_SPS;
+            else if (t == 8) flags |= AIV1_NAL_H264_PPS;
+            else if (t == 5) flags |= AIV1_NAL_H264_IDR;
+        } else {
+            uint32_t t = (d[off + 4] >> 1) & 0x3f;
+            if (t == 32) flags |= AIV1_NAL_H265_VPS;
+            else if (t == 33) flags |= AIV1_NAL_H265_SPS;
+            else if (t == 34) flags |= AIV1_NAL_H265_PPS;
+            else if (t >= 16 && t <= 23) flags |= AIV1_NAL_H265_IRAP;
+        }
+        off += 4 + (size_t)n;
+    }
+    *nal_flags = flags;
+    return 0;
+}
+
+/* AVCC → Annex B 原地转换（4 字节长度前缀 → 00 00 00 01 起始码） */
+static int aiv1_avcc_to_annexb(uint32_t codec, uint8_t *d, size_t size)
+{
+    size_t off = 0;
+    unsigned ignored;
+    if (aiv1_avcc_inspect(codec, d, size, &ignored) != 0) return -1;
+    while (off < size) {
+        uint32_t n = aiv1_u32be(d + off);
+        d[off] = 0; d[off + 1] = 0; d[off + 2] = 0; d[off + 3] = 1;
+        off += 4 + (size_t)n;
+    }
+    return 0;
+}
+
+static int aiv1_connect(capture_t *cap)
+{
+    struct sockaddr_un addr;
+    struct ucred cred;
+    socklen_t clen = sizeof(cred);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct timeval tv = { .tv_sec = AIV1_READ_TIMEOUT_S, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", cap->aiv1_path);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        snprintf(cap->last_error, sizeof(cap->last_error),
+                 "media socket 连接失败: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    /* 消费者身份校验：peer 必须是当前 go2rtc 实例（父进程=本进程），
+       防止接到重建前的旧实例或外来 socket */
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) != 0 ||
+        cred.pid != (pid_t)*cap->aiv1_peer_pid || cred.uid != geteuid()) {
+        snprintf(cap->last_error, sizeof(cap->last_error),
+                 "media socket peer 不符（pid=%d 期望 %ld）", cred.pid, *cap->aiv1_peer_pid);
+        close(fd);
+        return -1;
+    }
+    cap->aiv1_fd = fd;
+    return fd;
+}
+
+static int aiv1_read_exact(capture_t *cap, int fd, void *buf, size_t size)
+{
+    uint8_t *p = buf;
+    size_t off = 0;
+    while (off < size) {
+        ssize_t n = recv(fd, p + off, size - off, 0);
+        if (n > 0) { off += (size_t)n; continue; }
+        if (n == 0) { snprintf(cap->last_error, sizeof(cap->last_error), "media socket 对端关闭"); return -1; }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            snprintf(cap->last_error, sizeof(cap->last_error), "media socket 读超时（%ds 无数据）", AIV1_READ_TIMEOUT_S);
+        else
+            snprintf(cap->last_error, sizeof(cap->last_error), "media socket 读失败: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int aiv1_buffer_reserve(capture_t *cap, size_t size)
+{
+    size_t need = size + AV_INPUT_BUFFER_PADDING_SIZE;
+    if (need < size) return -1;
+    if (need <= cap->aiv1_buf_cap) return 0;
+    uint8_t *grown = realloc(cap->aiv1_buf, need);
+    if (!grown) return -1;
+    cap->aiv1_buf = grown;
+    cap->aiv1_buf_cap = need;
+    return 0;
+}
+
+static AVCodecContext *aiv1_open_decoder(uint32_t codec)
+{
+    enum AVCodecID id = codec == AIV1_CODEC_H265 ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264;
+    const AVCodec *c = avcodec_find_decoder(id);
+    if (!c) return NULL;
+    AVCodecContext *dec = avcodec_alloc_context3(c);
+    if (!dec) return NULL;
+    dec->thread_count = 1;          /* 单核 A53：多线程只放大参考帧缓冲 */
+    if (avcodec_open2(dec, c, NULL) < 0) {
+        avcodec_free_context(&dec);
+        return NULL;
+    }
+    return dec;
+}
+
+static void *aiv1_thread(void *arg)
+{
+    capture_t *cap = arg;
+    static pthread_once_t log_once2 = PTHREAD_ONCE_INIT;
+    pthread_once(&log_once2, capture_log_limit);
+    while (!cap->stop) {
+        int fd = aiv1_connect(cap);
+        if (fd < 0) {
+            usleep(3 * 1000 * 1000);
+            continue;
+        }
+        /* 握手 */
+        aiv1_hello_t hello;
+        uint8_t hdr[AIV1_HELLO_SIZE];
+        AVCodecContext *dec = NULL;
+        bool ok = aiv1_read_exact(cap, fd, hdr, sizeof(hdr)) == 0 &&
+                  aiv1_parse_hello(hdr, sizeof(hdr), &hello) == 0;
+        if (!ok) {
+            if (!cap->last_error[0])
+                snprintf(cap->last_error, sizeof(cap->last_error), "AIVH 握手失败");
+            else
+                snprintf(cap->last_error, sizeof(cap->last_error),
+                         "AIVH 握手失败: %.80s", cap->last_error);
+            goto session_end;
+        }
+        dec = aiv1_open_decoder(hello.codec);
+        if (!dec) {
+            snprintf(cap->last_error, sizeof(cap->last_error), "解码器打开失败（codec=%u）", hello.codec);
+            goto session_end;
+        }
+        fprintf(stderr, "multicam: AIV1 会话建立（codec=%s epoch=%llu）\n",
+                hello.codec == AIV1_CODEC_H265 ? "h265" : "h264",
+                (unsigned long long)hello.stream_epoch);
+        cap->burst_left = 0;
+        {
+            bool waiting_sync = true;      /* 等待完整同步关键帧（断流/换代后） */
+            bool have_seq = false;
+            uint64_t last_seq = 0;
+            bool alive = true;
+            AVFrame *frm = av_frame_alloc();
+            AVPacket *pkt = av_packet_alloc();
+            while (!cap->stop && alive) {
+                aiv1_frame_t f;
+                uint8_t fh[AIV1_FRAME_HDR_SIZE];
+                if (aiv1_read_exact(cap, fd, fh, sizeof(fh)) != 0 ||
+                    aiv1_parse_frame(fh, sizeof(fh), &hello, &f) != 0 ||
+                    f.payload_len > AIV1_MAX_PAYLOAD ||
+                    aiv1_buffer_reserve(cap, f.payload_len) != 0 ||
+                    aiv1_read_exact(cap, fd, cap->aiv1_buf, f.payload_len) != 0) {
+                    if (!cap->last_error[0])
+                        snprintf(cap->last_error, sizeof(cap->last_error), "AIVF 帧读取失败");
+                    alive = false;
+                    break;
+                }
+                memset(cap->aiv1_buf + f.payload_len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+                unsigned nal = 0;
+                if (aiv1_avcc_inspect(f.codec, cap->aiv1_buf, f.payload_len, &nal) != 0) {
+                    snprintf(cap->last_error, sizeof(cap->last_error), "AVCC 结构非法");
+                    alive = false;
+                    break;
+                }
+                bool key = (f.flags & AIV1_FLAG_KEYFRAME) != 0;
+                bool complete = (f.codec == AIV1_CODEC_H264 ?
+                                 (nal & AIV1_NAL_H264_SYNC) == AIV1_NAL_H264_SYNC :
+                                 (nal & AIV1_NAL_H265_SYNC) == AIV1_NAL_H265_SYNC);
+                if (key != complete) {   /* 协议一致性：关键帧必须自带参数集 */
+                    snprintf(cap->last_error, sizeof(cap->last_error), "关键帧缺少参数集");
+                    alive = false;
+                    break;
+                }
+                if (have_seq && f.output_seq != last_seq + 1)
+                    waiting_sync = true;  /* 序列断档：等下一个完整关键帧 */
+                last_seq = f.output_seq;
+                have_seq = true;
+                if (f.flags & AIV1_FLAG_DISCONT)
+                    waiting_sync = true;
+                if (waiting_sync) {
+                    if (!key) continue;
+                    waiting_sync = false;
+                }
+                window_step(cap, key, dec);
+                if (aiv1_avcc_to_annexb(f.codec, cap->aiv1_buf, f.payload_len) != 0) {
+                    snprintf(cap->last_error, sizeof(cap->last_error), "AVCC→AnnexB 转换失败");
+                    alive = false;
+                    break;
+                }
+                pkt->data = cap->aiv1_buf;
+                pkt->size = (int)f.payload_len;
+                int rc = avcodec_send_packet(dec, pkt);
+                if (rc < 0 && rc != AVERROR(EAGAIN)) {
+                    snprintf(cap->last_error, sizeof(cap->last_error), "解码 send rc=%d", rc);
+                    alive = false;
+                } else if (rc >= 0 && drain_frames(cap, dec, frm) != 0) {
+                    snprintf(cap->last_error, sizeof(cap->last_error), "解码 receive 失败");
+                    alive = false;
+                }
+            }
+            av_frame_free(&frm);
+            av_packet_free(&pkt);
+        }
+session_end:
+        avcodec_free_context(&dec);
+        if (cap->aiv1_fd >= 0) { close(cap->aiv1_fd); cap->aiv1_fd = -1; }
+        else if (fd >= 0) close(fd);
+        if (!cap->stop) {
+            cap->reconnects++;
+            fprintf(stderr, "multicam: AIV1 会话结束（%.100s），3s 后重连\n", cap->last_error);
+            usleep(3 * 1000 * 1000);
+        }
+    }
+    return NULL;
+}
+
+static int capture_start_common(capture_t *cap)
 {
     memset(cap, 0, sizeof(*cap));
-    snprintf(cap->url, sizeof(cap->url), "%s", url);
+    cap->aiv1_fd = -1;
     pthread_mutex_init(&cap->lock, NULL);
+    return 0;
+}
+
+int capture_start(capture_t *cap, const char *url)
+{
+    capture_start_common(cap);
+    snprintf(cap->url, sizeof(cap->url), "%s", url);
     if (pthread_create(&cap->thread, NULL, capture_thread, cap) != 0)
+        return -1;
+    cap->thread_started = true;
+    return 0;
+}
+
+int capture_start_aiv1(capture_t *cap, const char *sock_path, const long *peer_pid)
+{
+    capture_start_common(cap);
+    cap->aiv1 = true;
+    snprintf(cap->aiv1_path, sizeof(cap->aiv1_path), "%s", sock_path);
+    cap->aiv1_peer_pid = peer_pid;
+    if (pthread_create(&cap->thread, NULL, aiv1_thread, cap) != 0)
         return -1;
     cap->thread_started = true;
     return 0;
@@ -313,6 +674,11 @@ int capture_snapshot_jpeg(capture_t *cap, uint8_t *buf, size_t buf_cap)
 void capture_stop(capture_t *cap)
 {
     cap->stop = true;
+    if (cap->aiv1) {
+        /* shutdown 立即唤醒阻塞在 recv 的 AIV1 线程（SO_RCVTIMEO 最长 10s） */
+        int fd = cap->aiv1_fd;
+        if (fd >= 0) shutdown(fd, SHUT_RDWR);
+    }
     if (cap->thread_started) {
         pthread_join(cap->thread, NULL);
         cap->thread_started = false;
@@ -320,6 +686,9 @@ void capture_stop(capture_t *cap)
     pthread_mutex_destroy(&cap->lock);
     free(cap->slot.data);
     cap->slot.data = NULL;
+    free(cap->aiv1_buf);
+    cap->aiv1_buf = NULL;
+    cap->aiv1_buf_cap = 0;
     if (cap->snap_enc) {
         AVCodecContext *e = cap->snap_enc;
         avcodec_free_context(&e);

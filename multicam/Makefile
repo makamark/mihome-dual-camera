@@ -3,7 +3,7 @@ TOP      ?= ..
 CROSS    ?= aarch64-linux-gnu-
 SYSROOT  ?= $(TOP)/reference/device/rootfs
 FFMPEG   ?= $(TOP)/thirdparty/ffmpeg-aarch64
-VERSION  ?= 0.6.2
+VERSION  ?= 0.7.0
 
 CC       := $(CROSS)gcc
 CFLAGS   := -O2 -Wall -Wextra -std=gnu11 -mcpu=cortex-a53 -mtune=cortex-a53 \

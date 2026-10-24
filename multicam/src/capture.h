@@ -19,7 +19,7 @@ typedef struct {
 } capture_slot_t;
 
 typedef struct {
-    char url[512];          /* rtsp://user:pass@host:port/stream */
+    char url[512];          /* rtsp://user:pass@host:port/stream（rtsp 直连模式） */
     capture_slot_t slot;
     pthread_mutex_t lock;
     volatile bool stop;
@@ -30,6 +30,15 @@ typedef struct {
     uint64_t pixfmt_drops;  /* 非 YUV420P/yuvj420p 像素格式被丢弃的帧数 */
     int warned_fmt;         /* 上次已告警的像素格式（每种只告警一次） */
     char last_error[160];
+    /* AIV1 输入模式（米家路）：不经 RTSP 回环，直接消费 go2rtc 实例的
+       media socket（unix 域）。免一次 RTSP/TCP 封装-解封装，且不再占用
+       实例唯一的 RTSP 观看位——检测与外部播放可并存。 */
+    bool aiv1;              /* 输入模式：true = AIV1，false = rtsp 直连 */
+    char aiv1_path[108];    /* 实例 media socket 路径（逐实例补丁进二进制） */
+    const long *aiv1_peer_pid; /* 实例 pid 指针（实例重建后更新；SO_PEERCRED 校验） */
+    volatile int aiv1_fd;   /* 当前连接 fd（stop 时 shutdown 立即唤醒 recv） */
+    uint8_t *aiv1_buf;      /* 帧载荷缓冲（AVCC 校验后原地转 Annex B） */
+    size_t aiv1_buf_cap;
     /* GOP 窗口解码：源 20fps 但画布只需 GOP 级更新——每个 GOP 从关键帧起
        连解 window_frames 帧，其余帧 AVDISCARD_NONKEY（只解析不重建，近零成本），
        下一个关键帧自动完全恢复。keyint 为实测平滑均值，供置灰阈值联动。 */
@@ -48,6 +57,9 @@ typedef struct {
 } capture_t;
 
 int capture_start(capture_t *cap, const char *url);
+/* AIV1 模式启动：peer_pid 指向 go2rtc 实例的 pid（实例重建后值更新，
+   每次重连按 SO_PEERCRED 校验，杜绝接到旧实例/外来 socket）。 */
+int capture_start_aiv1(capture_t *cap, const char *sock_path, const long *peer_pid);
 void capture_stop(capture_t *cap);
 
 /* 主循环每轮调用：enabled=0 恢复全解（标定旁路）；frames=每 GOP 连解帧数 */

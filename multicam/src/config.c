@@ -132,10 +132,8 @@ static int config_parse(multicam_config_t *cfg, const char *buf)
         sub = cJSON_GetObjectItem(it, "crop_x");
         cam->crop_x = cJSON_IsNumber(sub) ? sub->valueint : -1;
         sub = cJSON_GetObjectItem(it, "external");
-        cam->external = cJSON_IsTrue(sub);
-        /* external 只对米家路有意义（让出 go2rtc 实例的 RTSP 观看位）；
-           rtsp 直连路无实例，残留的 external 会让启动捕获/自愈被跳过（永久灰） */
-        if (!strncmp(cam->source, "rtsp://", 7)) cam->external = 0;
+        (void)sub;
+        cam->external = 0;   /* 已废弃：检测走 AIV1 不占 RTSP 观看位，恒为 0 */
         sub = cJSON_GetObjectItem(it, "enabled");
         cam->enabled = !cJSON_IsBool(sub) || cJSON_IsTrue(sub);
         if (cam->tile + 1 > canvas_w) canvas_w = cam->tile + 1;
