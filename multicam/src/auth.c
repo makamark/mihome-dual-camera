@@ -103,7 +103,16 @@ int auth_service_start(const char *data_dir, const char *g2r_bin,
     fclose(fp);
     chmod(yaml, 0600);
 
-    snprintf(g_auth_bin_tmp, sizeof(g_auth_bin_tmp), "%s", g2r_bin);
+    /* 授权 yaml 写盘后再打端口补丁：未补丁的二进制 camera 模块 RTSP 监听
+       硬编码 8554，与第 1 路实例冲突（token 在场时 lane-0 占 8554）。
+       补丁副本落 data_dir/tmp（8.3MB，停实例即删；授权低频，写损可忽略） */
+    char patched[512];
+    if (g2r_make_patched_bin(g2r_bin, AUTH_PORT, data_dir, AUTH_INDEX,
+                             patched, sizeof(patched), err, err_cap) != 0) {
+        pthread_mutex_unlock(&g_auth_lock);
+        return -1;
+    }
+    snprintf(g_auth_bin_tmp, sizeof(g_auth_bin_tmp), "%s", patched);
     unlink(sock);
 
     /* GOMEMLIMIT/GOGC/GOMAXPROCS 由 main() 进程级设置，子进程继承 */

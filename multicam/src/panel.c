@@ -499,7 +499,9 @@ static int bridge_auth_status(ainice_bridge_response_t *response)
 }
 
 /* 从 yaml 移除 xiaomi: 段及其缩进子行（保留其余配置；auth.clear 用，
-   否则 token 会从 mh yaml 回退源复活，清除不彻底） */
+   否则 token 会从 mh yaml 回退源复活，清除不彻底）。
+   原子写：先过滤到内存再 tmp+rename——非原子直接 truncate 重写时进程
+   中途死亡会把整个 yaml 写坏（token/其他段全丢） */
 static void strip_xiaomi_section(const char *path)
 {
     FILE *f = fopen(path, "r");
@@ -508,8 +510,10 @@ static void strip_xiaomi_section(const char *path)
     size_t n = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
     buf[n] = 0;
-    FILE *o = fopen(path, "w");
-    if (!o) return;
+    /* 输出上界：逐行补 \n 最多比原文件多 N 行换行，n/2+64 裕量足够 */
+    char *out = malloc(n + n / 2 + 64);
+    if (!out) return;
+    size_t olen = 0;
     bool in_section = false;
     char *line = buf, *next;
     while (line && *line) {
@@ -517,10 +521,22 @@ static void strip_xiaomi_section(const char *path)
         if (next) *next++ = 0;
         if (!strncmp(line, "xiaomi:", 7)) { in_section = true; }
         else if (in_section && (line[0] == ' ' || line[0] == '\t')) { /* 属于段的行，跳过 */ }
-        else { in_section = false; fprintf(o, "%s\n", line); }
+        else {
+            in_section = false;
+            olen += (size_t)snprintf(out + olen, n + n / 2 + 64 - olen, "%s\n", line);
+        }
         line = next;
     }
-    fclose(o);
+    char tmp[600];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *o = fopen(tmp, "w");
+    if (o) {
+        size_t w = fwrite(out, 1, olen, o);
+        fclose(o);
+        if (w == olen && rename(tmp, path) != 0) unlink(tmp);
+        else if (w != olen) unlink(tmp);
+    }
+    free(out);
 }
 
 /* 清除授权：删自持快照与实例 yaml（g2r_start 会重建），清授权实例与

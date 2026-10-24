@@ -11,10 +11,21 @@
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #define DISC_START_TIMEOUT_MS 25000
+
+/* 收割子进程（SIGKILL 后短暂重试；catalog 子进程由 bridge 线程串行管理） */
+static void reap_child(pid_t pid)
+{
+    if (pid <= 0) return;
+    for (int i = 0; i < 10; i++) {
+        if (waitpid(pid, NULL, WNOHANG) > 0) return;
+        usleep(50 * 1000);
+    }
+}
 
 static int64_t now_ms(void)
 {
@@ -51,14 +62,18 @@ int catalog_ensure_instance(const char *data_dir, const char *mh_yaml,
             return 0; /* 已在运行 */
     }
 
-    /* fork 发现实例（仅 xiaomi 目录模块，无 camera 源；随父进程死 + 内存上限） */
+    /* fork 发现实例（仅 xiaomi 目录模块，无 camera 源；随父进程死 + 内存上限）。
+       ⚠ 绝不能 setenv→fork→unsetenv：unsetenv 会把 main() 进程级设置的
+       GOMEMLIMIT/GOGC/GOMAXPROCS 一并摘掉，此后 fork 的所有 go2rtc 子进程
+       （watcher 重建/换源/授权实例）失去内存上限（实测单实例 RSS 6-8MB→11MB+）。
+       正确姿势：fork 后恢复 main() 的原值（与 main.c 保持一致）。 */
     setenv("GOMEMLIMIT", "16MiB", 1);
     setenv("GOGC", "40", 1);
     setenv("GOMAXPROCS", "1", 1);
     pid_t pid = fork();
-    unsetenv("GOMEMLIMIT");
-    unsetenv("GOGC");
-    unsetenv("GOMAXPROCS");
+    setenv("GOMEMLIMIT", "8MiB", 1);
+    setenv("GOGC", "30", 1);
+    setenv("GOMAXPROCS", "1", 1);
     if (pid == 0) {
         prctl(PR_SET_PDEATHSIG, SIGKILL);
         setsid();
@@ -78,6 +93,9 @@ int catalog_ensure_instance(const char *data_dir, const char *mh_yaml,
         }
         usleep(200 * 1000);
     }
+    /* 启动超时：杀掉并收割，不留孤儿实例常驻吃内存 */
+    kill(pid, SIGKILL);
+    reap_child(pid);
     snprintf(err, err_cap, "发现实例启动超时（看 %s）", logp);
     return -1;
 }
@@ -209,11 +227,18 @@ cJSON *catalog_fetch_devices(const char *sock, char *err, size_t err_cap)
     int pages = 0;
     while (pages < 20) {
         char path[320];
-        if (strstr(ep, "start_did=%s") || strstr(ep, "start_did="))
-            snprintf(path, sizeof(path), "%s%s%s", ep,
-                     strchr(ep, '?') ? "&" : "?", start_did[0] ? start_did : "");
-        else
+        /* 分页参数：端点自带空值 start_did= 结尾则直接补值；
+           否则统一追加 ?/&start_did=<游标>（旧实现拼裸 did，服务端不识别） */
+        if (!start_did[0]) {
             snprintf(path, sizeof(path), "%s", ep);
+        } else {
+            size_t epl = strlen(ep);
+            if (epl > 10 && !strcmp(ep + epl - 10, "start_did="))
+                snprintf(path, sizeof(path), "%s%s", ep, start_did);
+            else
+                snprintf(path, sizeof(path), "%s%sstart_did=%s", ep,
+                         strchr(ep, '?') ? "&" : "?", start_did);
+        }
 
         if (http_unix(sock, "GET", path, NULL, resp, sizeof(resp)) != 0) break;
         cJSON *root = cJSON_Parse(resp);
@@ -261,10 +286,13 @@ void catalog_stop_instance(const char *data_dir)
             close(fd);
             if (n <= 0) continue;
             buf[n] = 0;
-            if (strstr(buf, "go2rtc") && strstr(buf, "go2rtc-disc.yaml")) {
-                pid_t pid = (pid_t)atoi(e->d_name);
-                if (pid > 1) kill(pid, SIGKILL);
+        if (strstr(buf, "go2rtc") && strstr(buf, "go2rtc-disc.yaml")) {
+            pid_t pid = (pid_t)atoi(e->d_name);
+            if (pid > 1) {
+                kill(pid, SIGKILL);
+                reap_child(pid);   /* 是本进程 fork 的子进程，不收割会留僵尸 */
             }
+        }
         }
         closedir(d);
     }
