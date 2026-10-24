@@ -1,4 +1,5 @@
 #include "catalog.h"
+#include "auth.h"
 #include "g2r.h"
 #include "httputil.h"
 #include <dirent.h>
@@ -38,6 +39,12 @@ int catalog_ensure_instance(const char *data_dir, const char *mh_yaml,
                             const char *g2r_bin, char *err, size_t err_cap)
 {
     char yaml[512], sock[512], logp[512], tokens[2048];
+    /* 授权短信会话进行中：发现实例让路（两实例并存会在线程配额紧张的
+       设备上互相挤兑，历史上曾致授权实例静默死亡、等码会话作废） */
+    if (auth_sms_active()) {
+        snprintf(err, err_cap, "授权会话进行中，设备列表稍后自动可查");
+        return -1;
+    }
     snprintf(sock, sizeof(sock), "%s/tmp/g2r-disc.sock", data_dir);
     snprintf(logp, sizeof(logp), "%s/tmp/g2r-disc.log", data_dir);
     snprintf(yaml, sizeof(yaml), "%s/go2rtc-disc.yaml", data_dir);

@@ -540,6 +540,7 @@ const AUTH_ERROR_TEXT = {
   "network": "网络连接失败，请稍后重试",
   "internal": "插件内部错误，请稍后重试",
   "conflict": "操作冲突，请稍后重试",
+  "session:sms_session_lost": "授权服务中断过，验证码已失效，请点「重新发送」获取新验证码",
   "rate_limit:rate_limit": "发送过于频繁，请稍候再试",
   "rate_limit:sms_retry_later": "发送过于频繁，请稍候再试",
   "rate_limit:sms_send_limit_tomorrow": "验证码发送过多，请明天再试",

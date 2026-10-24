@@ -243,6 +243,9 @@ static int run(const multicam_config_t *cfg)
     /* 清掉上一代 app 的孤儿 go2rtc（占端口/旧凭证的祸根） */
     g2r_kill_stale();
 
+    /* 授权服务接线：未授权期间常驻保活（0.6.1）——按需拉起会撞线程配额 */
+    auth_service_configure(cfg->data_dir, cfg->g2r_bin, cfg->mh_yaml);
+
     /* 配置是布局唯一事实源：tile 槽位取 cameras[].tile，禁用某路留灰位，
        防止后路前移导致 zone 串区 */
     for (int i = 0; i < cfg->camera_count; i++) {
@@ -496,7 +499,7 @@ static int run(const multicam_config_t *cfg)
                     malloc_trim(0);
                 }
 #endif
-                auth_idle_tick();   /* 授权实例空闲 10 分钟自动回收 */
+                auth_service_tick();  /* 未授权保活授权实例/已授权回收 */
 
                 /* 面板下拉换源：就地重建该路 go2rtc/捕获，不重启进程。
                    重建会阻塞主循环数秒（拨号/收线程），期间画布暂挂（另一路

@@ -495,6 +495,12 @@ static int bridge_auth_status(ainice_bridge_response_t *response)
     int authorized = auth_authorized(dir, "/data/plugins/mhcamera/go2rtc.yaml");
     cJSON_AddStringToObject(auth, "state_text",
                             authorized ? "authenticated" : "no_token");
+    /* 0.6.1 取证/观测：实例健康与会话代际（诊断授权中断用） */
+    cJSON_AddBoolToObject(auth, "service_alive", auth_service_alive());
+    cJSON_AddNumberToObject(auth, "spawns", auth_spawns());
+    cJSON_AddNumberToObject(auth, "last_exit_status", auth_last_exit_status());
+    cJSON_AddNumberToObject(auth, "last_term_sig", auth_last_term_sig());
+    cJSON_AddBoolToObject(auth, "session_valid", auth_session_valid());
     return reply_json(response, r);
 }
 
