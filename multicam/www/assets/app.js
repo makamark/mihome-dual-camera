@@ -327,7 +327,7 @@ function renderCameras() {
       applySource(cam.tile, cam.source, dev.name || dev.id);
     };
     /* 自行接入：rtsp:// 地址或 xiaomi:// 小米链接，回车/失焦或点「连接」即生效 */
-    function applyDirect() {
+    async function applyDirect() {
       const v = card.querySelector(".src").value.trim();
       srcDrafts[cam.tile] = v;
       if (/^xiaomi:\/\//.test(v)) {

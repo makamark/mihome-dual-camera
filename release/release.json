@@ -1,9 +1,10 @@
 {
   "id": "multicam",
-  "version": "0.7.0",
-  "package_url": "http://192.0.2.221:8080/multicam-0.7.0.plugin",
-  "sha256": "278ccd4ba9dc14534e8c77889c2a8892bb4567ed5318793fcb8b935616f9432c",
+  "version": "0.7.1",
+  "package_url": "http://192.0.2.221:8080/multicam-0.7.1.plugin",
+  "sha256": "7ba468f27596cbc114516170c43dbfec498f3db3ad30813f034535aaf7314d5d",
   "change_log": [
+    "0.7.1: 修复面板打不开（“正在加载插件页面…”超时）——0.6.2 起 applyDirect 函数内使用了 await 但未声明 async，ES module 严格解析下整份面板脚本解析失败、页面永远停在启动握手（node --check 按 script 宽松解析放行了该错误，已改按 module goal 校验）",
     "0.7.0: 检测链路改走 AIV1 内部通道（go2rtc media socket 直消费，vendor 自 mhcamera 协议）：不经 RTSP 回环，省一次 RTSP/TCP 封装-解封装；不再占用米家源唯一的 RTSP 观看位——检测与外部播放并存",
     "0.7.0: 「供外部播放」模式移除（不再需要暂停检测换观看位）：取流地址随时可连，米家源同一时间仍只允许一个外部播放器",
     "0.7.0: go2rtc 实例的 AIV1 media socket 逐实例补丁独立路径（不再依赖 mhcamera 数据目录）；tmp 目录强制 0700（服务端私有性校验）",
