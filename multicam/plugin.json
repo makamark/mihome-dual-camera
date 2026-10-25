@@ -1,6 +1,6 @@
 {
   "id": "multicam",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "upgrade_url": "http://192.0.2.221:8080/multicam/release.json",
   "name": {
     "zh": "米家双路摄像头",
