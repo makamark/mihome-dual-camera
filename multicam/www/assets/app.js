@@ -545,7 +545,7 @@ async function loadAll() {
   try {
     const r = await withRetry(() => call("multicam", "config.get"));
     state.cfg = r.config;
-    document.title = "米家双路摄像头";
+    document.title = "双路摄像头监控";
     delete state.cfg.areas;      /* 已废弃：检测区域由设备侧 zone profile 管理 */
     delete state.cfg.zones;
     if (!state.cfg.cameras) state.cfg.cameras = [];

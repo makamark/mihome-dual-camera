@@ -1,4 +1,4 @@
-# 米家双路摄像头（Mi Home Dual Camera）
+# 双路摄像头监控（Dual Camera Monitoring）
 
 把两路摄像头画面合成为一路，接入 AINICE 视觉传感器的分区有人检测，检测结果沿设备原有通道输出给米家 / Home Assistant。
 
