@@ -455,6 +455,7 @@ static void *aiv1_thread(void *arg)
     static pthread_once_t log_once2 = PTHREAD_ONCE_INIT;
     pthread_once(&log_once2, capture_log_limit);
     while (!cap->stop) {
+        cap->last_error[0] = 0;   /* 每会话重置：否则"首个错误优先"判断会一直沿用旧会话的错误 */
         int fd = aiv1_connect(cap);
         if (fd < 0) {
             usleep(3 * 1000 * 1000);
@@ -467,11 +468,13 @@ static void *aiv1_thread(void *arg)
         bool ok = aiv1_read_exact(cap, fd, hdr, sizeof(hdr)) == 0 &&
                   aiv1_parse_hello(hdr, sizeof(hdr), &hello) == 0;
         if (!ok) {
-            if (!cap->last_error[0])
+            char prev[96];
+            snprintf(prev, sizeof(prev), "%s", cap->last_error);
+            if (!prev[0])
                 snprintf(cap->last_error, sizeof(cap->last_error), "AIVH 握手失败");
             else
                 snprintf(cap->last_error, sizeof(cap->last_error),
-                         "AIVH 握手失败: %.80s", cap->last_error);
+                         "AIVH 握手失败: %.80s", prev);
             goto session_end;
         }
         dec = aiv1_open_decoder(hello.codec);
@@ -652,7 +655,8 @@ int capture_snapshot_jpeg(capture_t *cap, uint8_t *buf, size_t buf_cap)
     }
     pthread_mutex_unlock(&cap->lock);
 
-    /* 编码在锁外：enc/frm 仅 bridge 线程（单线程串行服务）访问 */
+    /* 编码在 cap->lock 外：enc/frm 仅 bridge 线程访问；调用方持 panel 的
+       g_caps_lock，主线程 capture_stop 前会经同锁解绑，不会中途释放 */
     f->pts = cap->snap_pts++;
     if (avcodec_send_frame(enc, f) < 0) return -1;
     AVPacket *pkt = av_packet_alloc();
@@ -816,7 +820,7 @@ int64_t capture_paint_squeeze(capture_t *cap, uint8_t *dst_y, uint8_t *dst_u, ui
     int16_t lx0[SQUEEZE_MAX_W], lx1[SQUEEZE_MAX_W], lfw[SQUEEZE_MAX_W];
     int16_t cx0[SQUEEZE_MAX_W / 2], cx1[SQUEEZE_MAX_W / 2], cfw[SQUEEZE_MAX_W / 2];
     for (int x = 0; x < out_w; x++) {
-        double s = crop_x + (x + 0.5) * (double)win_w / out_w - 0.5;
+        double s = (x + 0.5) * (double)win_w / out_w - 0.5;   /* 窗口内相对坐标，下方再加 crop_x */
         int x0 = (int)s;
         if (x0 < 0) x0 = 0;
         if (x0 > win_w - 1) x0 = win_w - 1;
@@ -830,7 +834,7 @@ int64_t capture_paint_squeeze(capture_t *cap, uint8_t *dst_y, uint8_t *dst_u, ui
     }
     int cw_out = out_w / 2, cw_win = win_w / 2, cw_crop = crop_x / 2;
     for (int x = 0; x < cw_out; x++) {
-        double s = cw_crop + (x + 0.5) * (double)cw_win / cw_out - 0.5;
+        double s = (x + 0.5) * (double)cw_win / cw_out - 0.5;
         int x0 = (int)s;
         if (x0 < 0) x0 = 0;
         if (x0 > cw_win - 1) x0 = cw_win - 1;

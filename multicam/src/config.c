@@ -105,7 +105,9 @@ static int config_parse(multicam_config_t *cfg, const char *buf)
         item = cJSON_GetObjectItem(root, "go2rtc");
         if (cJSON_IsObject(item)) {
             sub = cJSON_GetObjectItem(item, "binary");
-            if (cJSON_IsString(sub)) snprintf(cfg->g2r_bin, sizeof(cfg->g2r_bin), "%s", sub->valuestring);
+            /* 空串 = 用随包二进制（默认配置即为 ""，不能覆盖成空路径） */
+            if (cJSON_IsString(sub) && sub->valuestring[0])
+                snprintf(cfg->g2r_bin, sizeof(cfg->g2r_bin), "%s", sub->valuestring);
             sub = cJSON_GetObjectItem(item, "mhcamera_yaml");
             if (cJSON_IsString(sub)) snprintf(cfg->mh_yaml, sizeof(cfg->mh_yaml), "%s", sub->valuestring);
             sub = cJSON_GetObjectItem(item, "base_port");

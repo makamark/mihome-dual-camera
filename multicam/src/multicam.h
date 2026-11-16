@@ -15,7 +15,7 @@ typedef struct {
     int external;         /* 已废弃（0.7.0 起检测走 AIV1 直消费，不再占用
                              RTSP 观看位，检测与外部播放并存）。仅为旧配置
                              兼容保留解析，运行期恒为 0、不参与任何逻辑 */
-    char source[256];
+    char source[512];     /* 与 bridge/捕获/g2r 的 512 上限一致（长密码 rtsp URL） */
 } multicam_camera_t;
 
 /* 检测区域不再存插件配置：设备侧 zone profile 是唯一事实源

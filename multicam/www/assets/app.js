@@ -49,6 +49,12 @@ async function call(module, method, params, timeoutMs = 8000) {
   return r;
 }
 
+/* 设备名等来自米家 App（用户可编辑/他人分享），拼进 innerHTML 前必须转义 */
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
 /* ---------- 配置工具 ---------- */
 function accountFromCfg() {
   for (const c of state.cfg.cameras || []) {
@@ -135,9 +141,9 @@ function renderStatus() {
     const tip = live
       ? "画面正常"
       : (t.note || "等待画面");
-    return `<div class="tilechip" title="${tip}">
+    return `<div class="tilechip" title="${esc(tip)}">
       <span class="dot ${t.enabled ? (t.gray ? "gray" : "live") : ""}"></span>
-      <div><b>${camLabel(t.slot)}</b><small>${t.gray ? (t.note || "等待画面") : "画面正常"}</small></div>
+      <div><b>${esc(camLabel(t.slot))}</b><small>${esc(t.gray ? (t.note || "等待画面") : "画面正常")}</small></div>
     </div>`;
   }).join("");
 }
@@ -210,7 +216,7 @@ function renderCameras() {
     card.className = "cam-card";
     const did = camDid(cam);
     const opts = state.devices.map(d =>
-      `<option value="${d.id}" ${String(d.id) === did ? "selected" : ""}>${d.name || d.id}</option>`).join("");
+      `<option value="${esc(d.id)}" ${String(d.id) === did ? "selected" : ""}>${esc(d.name || d.id)}</option>`).join("");
     /* 取景窗口随压缩系数变化：蓝框宽 winW()，滑条范围 0..848-宽，居中=范围一半 */
     const BW = winW(), maxX = 848 - BW, centerX = (maxX / 2) & ~1;
     const cropX = cam.crop_x != null && cam.crop_x >= 0 ? Math.min(cam.crop_x & ~1, maxX) : centerX;
@@ -241,7 +247,7 @@ function renderCameras() {
           </div>
         </div>
         <div class="rtsp-part">
-          <input class="src" type="text" placeholder="rtsp://… 或 xiaomi://账号:cn@IP?did=设备ID" value="${srcVal.replace(/"/g, "&quot;")}" spellcheck="false">
+          <input class="src" type="text" placeholder="rtsp://… 或 xiaomi://账号:cn@IP?did=设备ID" value="${esc(srcVal)}" spellcheck="false">
           <button type="button" class="btn micro src-go">连接</button>
         </div>
       </div>
@@ -288,7 +294,13 @@ function renderCameras() {
       const name = `第 ${tile + 1} 路`;
       $("save-msg").textContent = `${name}正在切换${label ? "到「" + label + "」" : ""}…`;
       try {
-        await call("multicam", "source.set", { tile, source: src }, 10000);
+        const r = await call("multicam", "source.set", { tile, source: src }, 10000);
+        if (r.error) throw new Error(r.error);
+        if (r.inactive) {
+          /* 未启用路后端只落盘、不热切换 */
+          $("save-msg").textContent = `${name}已记录新画面源，勾选启用并点「保存并应用」后生效`;
+          return true;
+        }
         $("save-msg").textContent = `${name}已切换，画面刷新中…`;
         setTimeout(() => refreshFramer(tile), 4000);
         return true;
@@ -327,7 +339,15 @@ function renderCameras() {
       applySource(cam.tile, cam.source, dev.name || dev.id);
     };
     /* 自行接入：rtsp:// 地址或 xiaomi:// 小米链接，回车/失焦或点「连接」即生效 */
+    /* 改完直接点「连接」会先触发 change 再 click：进行中的切换不重复发起
+       （米家源每次换源会阻塞插件主循环数十秒） */
+    let applying = false;
     async function applyDirect() {
+      if (applying) return;
+      applying = true;
+      try { await applyDirectOnce(); } finally { applying = false; }
+    }
+    async function applyDirectOnce() {
       const v = card.querySelector(".src").value.trim();
       srcDrafts[cam.tile] = v;
       if (/^xiaomi:\/\//.test(v)) {
@@ -359,7 +379,7 @@ function renderCameras() {
       cam.source = v;
       /* 清掉残留的米家设备元数据，状态芯片改按 rtsp 地址显示 */
       cam.name = ""; cam.did = ""; cam.model = ""; cam.localip = "";
-      applySource(cam.tile, v, null);
+      await applySource(cam.tile, v, null);
     }
     card.querySelector(".src").onchange = applyDirect;
     card.querySelector(".src-go").onclick = applyDirect;
@@ -746,7 +766,8 @@ $("cam-refresh").onclick = () => refreshDevices(false);
 $("cam-add").onclick = () => {
   const n = (state.cfg.cameras || []).length;
   if (n >= 8) return flash("最多 8 路");
-  state.cfg.cameras.push({ id: "cam-" + (n + 1), tile: n, enabled: false, source: "" });
+  /* 占位源 xiaomi://（= 待配置）；空串会被 config.set 校验拒绝 */
+  state.cfg.cameras.push({ id: "cam-" + (n + 1), tile: n, enabled: false, source: "xiaomi://" });
   markDirty(); renderCameras();
 };
 

@@ -332,7 +332,12 @@ int g2r_start(g2r_instance_t *inst, char *err, size_t err_cap)
         execl(inst->tmp_bin, inst->tmp_bin, "-config", yaml, (char *)NULL);
         _exit(127);
     }
-    if (inst->pid < 0) { snprintf(err, err_cap, "fork 失败"); return -1; }
+    if (inst->pid < 0) {
+        /* 复位为 0：watcher 只重建 pid==0 的实例，留 -1 该路永不重试 */
+        inst->pid = 0;
+        snprintf(err, err_cap, "fork 失败: %s", strerror(errno));
+        return -1;
+    }
 
     /* 等 unix socket 就绪（每阶段独立超时，避免多实例累积共享截止时间） */
     char resp[4096];
@@ -346,8 +351,18 @@ int g2r_start(g2r_instance_t *inst, char *err, size_t err_cap)
 
     /* 下发源并等 running；state=error（离线/拒绝/坏源）已确定失败，快速返回
        不等满窗——否则一台离线摄像头会把整体启动拖慢 20s */
-    char body[768];
-    snprintf(body, sizeof(body), "{\"source\":\"%s\"}", inst->source);
+    char body[1280], esc[1100];
+    {
+        /* JSON 字符串转义（自行粘贴的 xiaomi 链接可能含 " 或 \） */
+        size_t o = 0;
+        for (const char *p = inst->source; *p && o + 3 < sizeof(esc); p++) {
+            if (*p == '"' || *p == '\\') esc[o++] = '\\';
+            if ((unsigned char)*p < 0x20) continue;
+            esc[o++] = *p;
+        }
+        esc[o] = 0;
+    }
+    snprintf(body, sizeof(body), "{\"source\":\"%s\"}", esc);
     bool source_ok = false;
     int64_t dl_src = now_ms() + 20000;
     while (now_ms() < dl_src) {

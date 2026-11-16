@@ -310,19 +310,25 @@ static int handle_source_set(cJSON *params, ainice_bridge_response_t *response)
         buf[n] = 0;
         cJSON *doc = cJSON_Parse(buf);
         cJSON *cams = doc ? cJSON_GetObjectItem(doc, "cameras") : NULL;
-        cJSON *it;
-        bool found = false;
+        cJSON *it, *hit = NULL;
+        /* 同 tile 可能有多项（只允许一项启用）：优先改启用项，否则第一项 */
         cJSON_ArrayForEach(it, cams) {
             cJSON *t = cJSON_GetObjectItem(it, "tile");
-            if (cJSON_IsNumber(t) && t->valueint == tile) {
-                cJSON *s = cJSON_GetObjectItem(it, "source");
-                if (cJSON_IsString(s)) cJSON_SetValuestring(s, src);
-                else cJSON_AddStringToObject(it, "source", src);
-                found = true;
-                break;
-            }
+            if (!cJSON_IsNumber(t) || t->valueint != tile) continue;
+            cJSON *en = cJSON_GetObjectItem(it, "enabled");
+            bool on = !cJSON_IsBool(en) || cJSON_IsTrue(en);
+            if (on) { hit = it; break; }
+            if (!hit) hit = it;
         }
-        if (!found) {
+        if (hit) {
+            cJSON *s = cJSON_GetObjectItem(hit, "source");
+            if (cJSON_IsString(s)) cJSON_SetValuestring(s, src);
+            else cJSON_AddStringToObject(hit, "source", src);
+            cJSON *en = cJSON_GetObjectItem(hit, "enabled");
+            /* 未启用路只落盘不热切换：告诉前端需启用并保存 */
+            if (cJSON_IsFalse(en)) cJSON_AddBoolToObject(r, "inactive", true);
+        }
+        if (!hit) {
             cJSON_Delete(doc);
             cJSON_AddStringToObject(r, "error", "配置中未找到该 tile");
             return reply_json(response, r);
@@ -358,15 +364,24 @@ static int handle_preview_full(cJSON *params, ainice_bridge_response_t *response
     if (cJSON_IsNumber(j)) tile = j->valueint;
     else if (cJSON_IsString(j) && j->valuestring[0]) tile = atoi(j->valuestring);
 
+    /* g_caps_lock 持有到编码结束：主线程 capture_stop/start 前先经
+       panel_bind_captures（同锁）解绑该路，确保不会在编码中途释放编码器/槽位 */
     capture_t *cap = NULL;
     pthread_mutex_lock(&g_caps_lock);
     if (tile >= 0 && tile < MULTICAM_MAX_TILES && g_caps && g_cap_by_tile[tile] >= 0)
         cap = &g_caps[g_cap_by_tile[tile]];
-    pthread_mutex_unlock(&g_caps_lock);
 
     snap_cache_t *c = &g_snap_cache[tile >= 0 && tile < MULTICAM_MAX_TILES ? tile : 0];
     int64_t now = now_ms();
-    if (cap && c->buf && c->len && now - c->ms < 150) {
+    int n = 0;
+    if (cap && !(c->buf && c->len && now - c->ms < 150)) {
+        if (!c->buf) c->buf = malloc(SNAP_BUF_CAP);
+        n = c->buf ? capture_snapshot_jpeg(cap, c->buf, SNAP_BUF_CAP) : -3;
+        if (n >= 0) { c->len = (size_t)n; c->ms = now; }
+    }
+    pthread_mutex_unlock(&g_caps_lock);
+
+    if (cap && n >= 0 && c->buf && c->len) {
         cJSON *r = resp_ok();
         char *b64 = malloc((c->len + 2) / 3 * 4 + 1);
         if (!b64) { cJSON_AddStringToObject(r, "error", "oom"); return reply_json(response, r); }
@@ -381,29 +396,9 @@ static int handle_preview_full(cJSON *params, ainice_bridge_response_t *response
         cJSON_AddStringToObject(r, "error", "捕获未就绪（插件启动中或该路未启用）");
         return reply_json(response, r);
     }
-    if (!c->buf) {
-        c->buf = malloc(SNAP_BUF_CAP);
-        if (!c->buf) {
-            cJSON *r = resp_ok();
-            cJSON_AddStringToObject(r, "error", "oom");
-            return reply_json(response, r);
-        }
-    }
-    int n = capture_snapshot_jpeg(cap, c->buf, SNAP_BUF_CAP);
-    if (n < 0) {
-        cJSON *r = resp_ok();
-        cJSON_AddStringToObject(r, "error", n == -2 ? "JPEG 过大（缓冲不足）" : "无可用帧");
-        return reply_json(response, r);
-    }
-    c->len = (size_t)n;
-    c->ms = now;
     cJSON *r = resp_ok();
-    char *b64 = malloc(((size_t)n + 2) / 3 * 4 + 1);
-    if (!b64) { cJSON_AddStringToObject(r, "error", "oom"); return reply_json(response, r); }
-    b64_encode(c->buf, c->len, b64);
-    cJSON_AddStringToObject(r, "jpeg", b64);
-    cJSON_AddNumberToObject(r, "ts", c->ms);
-    free(b64);
+    cJSON_AddStringToObject(r, "error", n == -3 ? "oom" :
+                            n == -2 ? "JPEG 过大（缓冲不足）" : "无可用帧");
     return reply_json(response, r);
 }
 
