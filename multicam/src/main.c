@@ -287,8 +287,8 @@ static int run(const multicam_config_t *cfg)
     uint8_t *canvas = NULL;
     push_t push = {0};
     int tile_w = 0, tile_h = 0, canvas_w = 0, canvas_h = 0;
-    int src_w = 0, src_h = 0;
-    int win_w = 0;                     /* crop_1x2 每路取景窗口宽（>tile_w = 横向压缩） */
+    int src_w = 0, src_h = 0;          /* 旧网格布局的统一 tile 尺寸来源（首路首帧） */
+    int lane_win[MULTICAM_MAX_TILES] = {0};   /* crop_1x2 每槽位实际取景窗口宽（状态用） */
     bool push_opened = false;
     pthread_t watcher_th;
     bool watcher_started = false;
@@ -436,7 +436,7 @@ static int run(const multicam_config_t *cfg)
                 continue;
             }
             if (src_w == 0) { src_w = w; src_h = h; }
-            else if (w != src_w || h != src_h) {
+            else if ((w != src_w || h != src_h) && strcmp(cfg->layout_type, "crop_1x2")) {
                 /* 不再整体退出（监督器不拉起 = 用户卡死"无法启用"）：
                    paint 阶段按 -2 自校验把该路置灰（"分辨率不符"） */
                 fprintf(stderr, "multicam: cam[%d](%s) 分辨率 %dx%d 与首路 %dx%d 不一致，该路置灰继续\n",
@@ -451,19 +451,17 @@ static int run(const multicam_config_t *cfg)
                     src_w, src_h);
         }
         if (!strcmp(cfg->layout_type, "crop_1x2")) {
+            /* 画布固定 800×480（5:3 = 检测模型输入比例）：每路按自身分辨率取
+               窗口缩放进 400×480，两路分辨率不必相同，运行中变化也自动跟随 */
             tile_w = 400;
-            tile_h = src_h;
+            tile_h = 480;
             cols = 2;
             rows = 1;
             n_slots = 2;
             canvas_w = 800;
-            canvas_h = tile_h;
-            win_w = tile_w * cfg->squeeze_pct / 100;
-            if (win_w > src_w) win_w = src_w & ~1;
-            if (win_w < tile_w) win_w = tile_w;
-            fprintf(stderr, "multicam: 左右并排（源 %dx%d，压缩 %.2f×：每路取景 %dx%d → tile 400x%d）→ 画布 %dx%d(5:3) @%dfps\n",
-                    src_w, src_h, cfg->squeeze_pct / 100.0, win_w, tile_h, tile_h,
-                    canvas_w, canvas_h, cfg->fps);
+            canvas_h = 480;
+            fprintf(stderr, "multicam: 左右并排（压缩 %.2f×，每路按源分辨率取景缩放 → tile 400x480）→ 画布 %dx%d(5:3) @%dfps\n",
+                    cfg->squeeze_pct / 100.0, canvas_w, canvas_h, cfg->fps);
         } else {
             tile_w = src_w;
             tile_h = src_h;
@@ -494,7 +492,7 @@ static int run(const multicam_config_t *cfg)
         int64_t last_trim_ms = 0;
         bool slot_gray[MULTICAM_MAX_TILES] = {false};
         int64_t gray_since[MULTICAM_MAX_TILES] = {0};
-        char slot_note[MULTICAM_MAX_TILES][64] = {{0}};
+        char slot_note[MULTICAM_MAX_TILES][96] = {{0}};
         time_t proc_start = time(NULL);
 
         /* GOP 窗口解码按配置一次性下到各捕获线程（keyint 实测后自动激活） */
@@ -520,7 +518,7 @@ static int run(const multicam_config_t *cfg)
                 pst0.tile_w = tile_w; pst0.tile_h = tile_h;
                 pst0.layout_cols = cols;
                 pst0.squeeze_pct = cfg->squeeze_pct;
-                pst0.win_w = win_w;
+                pst0.win_w = lane_win[0];
                 pst0.fps = cfg->fps; pst0.frames = frames;
                 pst0.session_failures = session_failures;
                 pst0.started_at = proc_start; pst0.n_slots = n_slots;
@@ -537,8 +535,9 @@ static int run(const multicam_config_t *cfg)
                     pst0.tiles[s].decoded = caps[owner].slot.frame_count;
                     pst0.tiles[s].keyint_ms = (int)capture_keyint_ms(&caps[owner]);
                     pst0.tiles[s].crop_x = c->crop_x;
-                    pst0.tiles[s].src_w = src_w;
-                    pst0.tiles[s].src_h = src_h;
+                    capture_dims(&caps[owner], &pst0.tiles[s].src_w, &pst0.tiles[s].src_h);
+                    pst0.tiles[s].win_w = capture_fit_window(pst0.tiles[s].src_w, pst0.tiles[s].src_h,
+                                                             cfg->squeeze_pct, 400, 480);
                     pst0.tiles[s].g2r_port = inst[owner].port;
                     snprintf(pst0.tiles[s].g2r_user, sizeof(pst0.tiles[s].g2r_user), "%s", inst[owner].username);
                     snprintf(pst0.tiles[s].g2r_pass, sizeof(pst0.tiles[s].g2r_pass), "%s", inst[owner].password);
@@ -665,28 +664,24 @@ static int run(const multicam_config_t *cfg)
                         uint8_t *u = canvas + ysz + (size_t)(oy / 2) * (canvas_w / 2) + ox / 2;
                         uint8_t *v = u + (size_t)(canvas_w / 2) * (canvas_h / 2);
                         if (!strcmp(cfg->layout_type, "crop_1x2")) {
-                            int cx = cfg->cameras[cam_cfg[owner]].crop_x;
-                            if (cx < 0) cx = (src_w - win_w) / 2 & ~1;
-                            if (cx > src_w - win_w) cx = (src_w - win_w) & ~1;
-                            if (win_w != tile_w)
-                                age = capture_paint_squeeze(&caps[owner], y, u, v,
-                                                            canvas_w, canvas_w / 2,
-                                                            cx, 0, win_w, tile_h,
-                                                            tile_w, tile_h);
-                            else
-                                age = capture_paint_crop(&caps[owner], y, u, v,
-                                                         canvas_w, canvas_w / 2,
-                                                         cx, 0, tile_w, tile_h);
+                            age = capture_paint_fit(&caps[owner], y, u, v,
+                                                    canvas_w, canvas_w / 2,
+                                                    cfg->cameras[cam_cfg[owner]].crop_x,
+                                                    cfg->squeeze_pct, tile_w, tile_h,
+                                                    NULL, NULL, &lane_win[s]);
                         } else {
                             age = capture_paint_tile(&caps[owner], y, u, v,
                                                      canvas_w, canvas_w / 2, tile_w, tile_h);
                         }
                     }
                     if (age < 0 || age > stale_limit) {
-                        char want[64];
+                        char want[96], why[96] = "";
+                        /* 捕获侧有具体原因（认证失败/404/格式不支持…）优先显示 */
+                        if (owner >= 0) capture_note(&caps[owner], why, sizeof(why));
                         snprintf(want, sizeof(want), "%s",
                                  owner < 0 ? "该路未启用" :
                                  cam_unconfigured(&cfg->cameras[cam_cfg[owner]]) ? "该路待配置" :
+                                 why[0] ? why :
                                  age == -2 ? "分辨率不符" :
                                  age < 0 ? "无帧（拨号/解码未就绪）" : "断流超时");
                         if (!slot_gray[s]) {
@@ -748,7 +743,7 @@ static int run(const multicam_config_t *cfg)
                 pst.tile_w = tile_w; pst.tile_h = tile_h;
                 pst.layout_cols = cols;
                 pst.squeeze_pct = cfg->squeeze_pct;
-                pst.win_w = win_w;
+                pst.win_w = lane_win[0];
                 pst.fps = cfg->fps; pst.frames = frames;
                 pst.started_at = proc_start; pst.n_slots = n_slots;
                 for (int s = 0; s < n_slots; s++) {
@@ -765,8 +760,8 @@ static int run(const multicam_config_t *cfg)
                     pt->decoded = caps[owner].slot.frame_count;
                     pt->keyint_ms = (int)capture_keyint_ms(&caps[owner]);
                     pt->crop_x = c->crop_x;
-                    pt->src_w = src_w;
-                    pt->src_h = src_h;
+                    capture_dims(&caps[owner], &pt->src_w, &pt->src_h);
+                    pt->win_w = capture_fit_window(pt->src_w, pt->src_h, cfg->squeeze_pct, 400, 480);
                     pt->g2r_port = inst[owner].port;
                     snprintf(pt->g2r_user, sizeof(pt->g2r_user), "%s", inst[owner].username);
                     snprintf(pt->g2r_pass, sizeof(pt->g2r_pass), "%s", inst[owner].password);

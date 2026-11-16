@@ -3,17 +3,24 @@ import { getBridgeClient } from "/platform/sdk/bridge.js";
 const bridge = getBridgeClient();
 const $ = (id) => document.getElementById(id);
 
-const TILE_W = 848, TILE_H = 480;
-
-/* 取景宽度（横向压缩）：每路取景窗口宽 = 400×压缩系数，钳到 ≤848。
-   窗口比 400 宽时画面被水平压进 tile——覆盖更宽、人略显瘦，画布几何不变。 */
+/* 取景宽度（横向压缩）：每路取景窗口高 = 源全高，宽 = 源高×400/480×压缩系数
+   （848×480 米家子码流 1.0× 即 400 宽），超过源宽收敛为整幅。窗口被缩放进
+   400×480 tile——任意分辨率源都能用；窗口比 tile 宽时人略显瘦。 */
 function squeezeVal() {
   const s = +(state.cfg && state.cfg.layout && state.cfg.layout.squeeze || 1);
   return s >= 1 && s <= 2.5 ? s : 1;
 }
-function winW() {
-  /* 与后端整型算法一致：win = 400×round(s×100)/100，防止自定义压缩率下取景框差 2px */
-  return Math.min(TILE_W, Math.floor(400 * Math.round(squeezeVal() * 100) / 100)) & ~1;
+/* 每路源尺寸（来自运行状态；尚无帧时按米家子码流 848×480 预估，known=false） */
+function laneDims(tile) {
+  const t = state.status && (state.status.tiles || []).find(x => x.slot === Number(tile));
+  if (t && t.src_w > 0 && t.src_h > 0) return { w: t.src_w, h: t.src_h, known: true };
+  return { w: 848, h: 480, known: false };
+}
+function winW(tile) {
+  /* 与后端 capture_fit_window 同一整型算法，防止取景框差 2px */
+  const d = laneDims(tile);
+  const w = Math.floor(d.h * 400 * Math.round(squeezeVal() * 100) / (480 * 100)) & ~1;
+  return Math.max(2, Math.min(d.w & ~1, w));
 }
 
 const state = {
@@ -166,23 +173,26 @@ function chanOf(cam) {
 function drawFramer(tile) {
   const f = framers[tile];
   if (!f || !f.ctx) return;
-  const cx = f.ctx, W = 848, H = 480, BW = winW();
+  const d = laneDims(tile), W = d.w, H = d.h, BW = winW(tile);
+  if (f.canvas.width !== W || f.canvas.height !== H) { f.canvas.width = W; f.canvas.height = H; }
+  const cx = f.ctx;
   if (f.img) cx.drawImage(f.img, 0, 0, W, H);
   else {
     cx.fillStyle = "#101214"; cx.fillRect(0, 0, W, H);
-    cx.fillStyle = "#7a828c"; cx.font = "14px sans-serif";
-    cx.fillText("取景画面加载中…", 12, 24);
+    cx.fillStyle = "#7a828c"; cx.font = `${Math.round(H / 34)}px sans-serif`;
+    cx.fillText("取景画面加载中…", 12, H / 20);
   }
   const x = f.x;
   cx.fillStyle = "rgba(0, 0, 0, 0.55)";
   cx.fillRect(0, 0, x, H);
   cx.fillRect(x + BW, 0, W - x - BW, H);
   cx.strokeStyle = "#4ca7ff";
-  cx.lineWidth = 3;
-  cx.strokeRect(x + 1.5, 1.5, BW - 3, H - 3);
+  const lw = Math.max(3, Math.round(W / 280));   /* 线宽/字号随源尺寸缩放，显示时视觉一致 */
+  cx.lineWidth = lw;
+  cx.strokeRect(x + lw / 2, lw / 2, BW - lw, H - lw);
   cx.fillStyle = "rgba(76, 167, 255, 0.95)";
-  cx.font = "16px sans-serif";
-  cx.fillText(`画框 ${x} · 宽 ${BW}`, x + 10, 30);
+  cx.font = `${Math.round(H / 30)}px sans-serif`;
+  cx.fillText(`画框 ${x} · 宽 ${BW}`, x + 10, H / 16);
 }
 async function refreshFramer(tile) {
   const f = framers[tile];
@@ -217,10 +227,12 @@ function renderCameras() {
     const did = camDid(cam);
     const opts = state.devices.map(d =>
       `<option value="${esc(d.id)}" ${String(d.id) === did ? "selected" : ""}>${esc(d.name || d.id)}</option>`).join("");
-    /* 取景窗口随压缩系数变化：蓝框宽 winW()，滑条范围 0..848-宽，居中=范围一半 */
-    const BW = winW(), maxX = 848 - BW, centerX = (maxX / 2) & ~1;
+    /* 取景窗口随该路源尺寸与压缩系数变化：蓝框宽 winW，滑条 0..源宽-窗口宽，居中=一半 */
+    const dims = laneDims(cam.tile ?? i);
+    const BW = winW(cam.tile ?? i), maxX = dims.w - BW, centerX = (maxX / 2) & ~1;
     const cropX = cam.crop_x != null && cam.crop_x >= 0 ? Math.min(cam.crop_x & ~1, maxX) : centerX;
-    cam.crop_x = cropX;
+    /* 源尺寸未知（尚无帧）时只钳显示值、不改配置：按 848 预估钳会误改大分辨率源的取景 */
+    if (dims.known) cam.crop_x = cropX;
     const cropName = x => x === 0 ? "靠左" : x === maxX ? "靠右" : x === centerX ? "居中" : "自定义";
     const mode = modeOf(cam);
     const srcVal = srcDrafts[cam.tile] != null ? srcDrafts[cam.tile]
@@ -247,12 +259,25 @@ function renderCameras() {
           </div>
         </div>
         <div class="rtsp-part">
-          <input class="src" type="text" placeholder="rtsp://… 或 xiaomi://账号:cn@IP?did=设备ID" value="${esc(srcVal)}" spellcheck="false">
+          <input class="src" type="text" placeholder="rtsp://用户名:密码@IP:554/路径" value="${esc(srcVal)}" spellcheck="false">
           <button type="button" class="btn micro src-go">连接</button>
+          <details class="src-help">
+            <summary>填写说明</summary>
+            <p>格式 <code>rtsp://用户名:密码@IP:端口/路径</code>，端口不填默认 554；密码含 <code>/ ? # %</code> 时分别写成 <code>%2F %3F %23 %25</code>。建议填摄像头的<b>子码流</b>（1080p 以下，H.264 / H.265）。</p>
+            <ul>
+              <li>海康：<code>/Streaming/Channels/102</code></li>
+              <li>大华 / 乐橙：<code>/cam/realmonitor?channel=1&amp;subtype=1</code></li>
+              <li>TP-Link Tapo：<code>/stream2</code>（App 里先开启「摄像头账号」）</li>
+              <li>萤石：<code>/h264/ch1/sub/av_stream</code>（App 里先开启局域网 RTSP）</li>
+              <li>Reolink：<code>/h264Preview_01_sub</code></li>
+              <li>NAS / go2rtc / Frigate 转出的流：<code>rtsp://IP:8554/流名称</code></li>
+            </ul>
+            <p>不确定地址时，先用 VLC「打开网络串流」试播，能播放再填进来。也可粘贴 <code>xiaomi://</code> 小米链接。</p>
+          </details>
         </div>
       </div>
       <div class="framer">
-        <canvas class="framer-cv" width="848" height="480"></canvas>
+        <canvas class="framer-cv" width="${dims.w}" height="${dims.h}"></canvas>
         <div class="framer-bar">
           <span class="hint">左右拖动蓝框选取画面，保存后生效</span>
           <button type="button" class="btn micro framer-rl">刷新画面</button>
@@ -411,7 +436,7 @@ function renderCameras() {
       let dragging = false;
       const dragTo = e => {
         const r = cv.getBoundingClientRect();
-        const px = (e.clientX - r.left) * (848 / r.width);
+        const px = (e.clientX - r.left) * (cv.width / r.width);
         updateCrop(Math.round(px) - BW / 2);
       };
       cv.onpointerdown = e => { dragging = true; cv.setPointerCapture(e.pointerId); dragTo(e); };
@@ -590,6 +615,22 @@ async function loadAll() {
   try { await refreshStatus(); } catch (e) {}
 }
 
+/* 某路源分辨率首次得知/发生变化（换源、切码流）：取景器几何要按新尺寸重建。
+   用户正在卡片里输入或拖动时推迟到下轮，免得打断编辑 */
+let dimsKey = "";
+function rerenderOnDimsChange() {
+  if (!state.cfg) return;
+  const key = (state.cfg.cameras || []).map(c => {
+    const d = laneDims(c.tile || 0);
+    return d.known ? `${d.w}x${d.h}` : "?";
+  }).join(",");
+  if (key === dimsKey) return;
+  const ae = document.activeElement;
+  if (ae && $("cam-list").contains(ae) && ae.tagName !== "BUTTON") return;
+  dimsKey = key;
+  renderCameras();
+}
+
 async function refreshStatus() {
   try {
     const r = await call("multicam", "status.get", {}, 4000);
@@ -597,6 +638,7 @@ async function refreshStatus() {
     if (!canvas.width) canvasResize();
     renderStatus();
     updateRtspRows();
+    rerenderOnDimsChange();
   } catch (e) { /* 重启间隙 */ }
 }
 

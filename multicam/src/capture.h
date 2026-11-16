@@ -5,10 +5,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* 每路摄像头一个捕获线程：RTSP(TCP) → 解码(hevc/h264 软解) → 最新 YUV420P 帧。
-   槽位分辨率按首帧上锁（运行期分辨率变化只丢帧计数，不重新分配），
-   防止快照拷贝越界。消费方通过 capture_paint_tile 原子地把最近一帧
-   按行距直接拷进画布 tile 区域。 */
+/* 每路摄像头一个捕获线程：RTSP / AIV1 → 解码(hevc/h264/mjpeg 软解) → 最新 YUV420P 帧。
+   任意 YUV 像素格式（422/444/NV12/10bit/灰度）入槽时统一转 420P；运行期
+   分辨率变化就地重建槽位（读方都在槽位锁内按当时尺寸访问）。消费方经
+   capture_paint_fit / capture_paint_tile 原子地把最近一帧写进画布 tile。 */
 
 typedef struct {
     /* YUV420P 连续布局：Y(w*h) U(w*h/4) V(w*h/4) */
@@ -26,8 +26,10 @@ typedef struct {
     pthread_t thread;
     bool thread_started;
     uint64_t reconnects;
-    uint64_t size_drops;    /* 分辨率与槽位锁定值不符被丢弃的帧数 */
-    uint64_t pixfmt_drops;  /* 非 YUV420P/yuvj420p 像素格式被丢弃的帧数 */
+    uint64_t size_changes;  /* 运行期源分辨率变化次数（槽位重建） */
+    uint64_t pixfmt_drops;  /* 无法转换的像素格式被丢弃的帧数 */
+    char note[96];          /* 面板可读的无画面原因（认证失败/404/格式不支持…），有帧即清空；锁内读写 */
+    volatile bool rtsp_udp; /* rtsp 传输：false=TCP（默认），协商失败自动切换 */
     int warned_fmt;         /* 上次已告警的像素格式（每种只告警一次） */
     char last_error[160];
     /* AIV1 输入模式（米家路）：不经 RTSP 回环，直接消费 go2rtc 实例的
@@ -52,7 +54,7 @@ typedef struct {
     int64_t last_key_ms;          /* 上一个关键帧到达时刻（仅捕获线程访问） */
     /* 取景器 MJPEG 快照（仅 panel bridge 线程访问；void* 避免头文件引 ffmpeg） */
     void *snap_enc;               /* AVCodecContext*（懒初始化常驻） */
-    void *snap_frm;               /* AVFrame*（编码输入帧，尺寸按槽位锁定值） */
+    void *snap_frm;               /* AVFrame*（编码输入帧，源宽 >848 时等比缩小） */
     int64_t snap_pts;             /* 快照帧序号 */
 } capture_t;
 
@@ -88,19 +90,25 @@ int64_t capture_paint_crop(capture_t *cap, uint8_t *dst_y, uint8_t *dst_u, uint8
                            int crop_x, int crop_y,
                            int crop_w, int crop_h);
 
-/* 横向压缩取景（crop_1x2 + squeeze>1）：把源画面 (crop_x, crop_y) 起的
-   win_w×win_h 窗口水平双线性缩放成 out_w×out_h tile（垂直 1:1 拷贝行）。
-   窗口比 tile 宽 → 画面横向压缩（人变瘦）、实际取景覆盖更宽，画布几何不变。
-   窗口宽于源画面时收敛为整幅（覆盖全宽，实际压缩比降低）。
-   crop_x < 0 自动居中；win_w/out_w 须为偶数；out_h 须等于 win_h。
-   返回帧龄毫秒；无帧 -1；高度不足/参数非法 -2；out_w 超上限 -3。 */
-int64_t capture_paint_squeeze(capture_t *cap, uint8_t *dst_y, uint8_t *dst_u, uint8_t *dst_v,
-                              int dst_y_stride, int dst_c_stride,
-                              int crop_x, int crop_y,
-                              int win_w, int win_h,
-                              int out_w, int out_h);
+/* crop_1x2 取景窗口（与面板取景器同一算法）：窗口高 = 源全高，
+   窗口宽 = 源高 × out_w/out_h × 压缩系数（取偶，超过源宽则收敛为整幅）。
+   848×480 源 1.0× 即 400×480 原样裁切；1080p 源窗口 900×1080 缩放进 tile。 */
+int capture_fit_window(int src_w, int src_h, int squeeze_pct, int out_w, int out_h);
 
-/* 取景器快照：把当前槽位全幅帧编码成一帧 JPEG（面板拖动取景框用）。
+/* 按取景窗口把源画面缩放进 out_w×out_h tile（任意分辨率源）：窗口从 crop_x
+   起（<0 居中，越界收敛），窗口与 tile 等大时直拷，否则二维双线性缩放。
+   src_w/src_h/win_w 可空，回填该帧实际尺寸与窗口宽（面板状态用）。
+   返回帧龄毫秒；无帧 -1；参数非法 -2；out_w/out_h 超上限 -3。 */
+int64_t capture_paint_fit(capture_t *cap, uint8_t *dst_y, uint8_t *dst_u, uint8_t *dst_v,
+                          int dst_y_stride, int dst_c_stride,
+                          int crop_x, int squeeze_pct, int out_w, int out_h,
+                          int *src_w, int *src_h, int *win_w);
+
+/* 当前无画面原因（capture.note），无则空串。 */
+void capture_note(capture_t *cap, char *out, size_t cap_len);
+
+/* 取景器快照：把当前槽位全幅帧编码成一帧 JPEG（面板拖动取景框用；
+   源宽 >848 时等比缩小，面板按源尺寸绘制，坐标不受影响）。
    编码器懒初始化常驻（每路一个，仅 bridge 线程串行调用）。
    返回 JPEG 字节数；无帧 -1；输出缓冲不足 -2。 */
 int capture_snapshot_jpeg(capture_t *cap, uint8_t *buf, size_t buf_cap);

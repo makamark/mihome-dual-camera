@@ -93,7 +93,12 @@ details.fold[open] summary::after { transform: rotate(-90deg); }
 .src-row .chanseg .cseg { font: inherit; font-size: 12px; padding: 3px 10px; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
 .src-row .chanseg .cseg.active { background: var(--primary); color: #fff; }
 .src-row .chanseg .cseg:disabled { opacity: .45; cursor: not-allowed; }
-.src-row .rtsp-part { display: none; gap: 6px; align-items: center; }
+.src-row .rtsp-part { display: none; gap: 6px; align-items: center; flex-wrap: wrap; }
+.src-help { flex-basis: 100%; font-size: 12px; color: var(--muted); }
+.src-help summary { cursor: pointer; user-select: none; }
+.src-help p, .src-help ul { margin: 6px 0; line-height: 1.6; }
+.src-help ul { padding-left: 18px; }
+.src-help code { font-family: ui-monospace, monospace; font-size: 11px; word-break: break-all; }
 .src-row .rtsp-part .src { flex: 1; min-width: 0; }
 .cam-card.mode-rtsp .src-row .mi-part { display: none; }
 .cam-card.mode-rtsp .src-row .rtsp-part { display: flex; }

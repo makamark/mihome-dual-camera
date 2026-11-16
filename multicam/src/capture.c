@@ -3,6 +3,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/pixdesc.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -38,40 +39,133 @@ int64_t capture_keyint_ms(capture_t *cap)
     return cap->keyint_ms;
 }
 
-/* 槽位分辨率按首帧上锁：运行期分辨率变化（换源/切主子码流）只丢帧并计数，
-   绝不重新分配——消费方的画布 tile 缓冲按启动尺寸分配，扩容会溢出。 */
+/* 源分辨率上限（像素数）：157MB 设备上 1080p 以上的解码参考帧会挤爆内存，
+   超限在打开阶段即拒绝（提示用户改用子码流） */
+#define CAPTURE_MAX_PIXELS (1920 * 1088)
+
+/* 置灰原因（面板显示）：捕获线程写、主线程读，均在 cap->lock 内 */
+static void set_note(capture_t *cap, const char *note)
+{
+    pthread_mutex_lock(&cap->lock);
+    snprintf(cap->note, sizeof(cap->note), "%s", note);
+    pthread_mutex_unlock(&cap->lock);
+}
+
+/* 像素格式可转换判定：YUV（含灰度）平面/半平面、小端、≤16bit。
+   NV12/422/444/10bit 等统一按 desc 的 plane/step/offset/shift 逐点采样转 420P */
+static bool pixfmt_convertible(const AVPixFmtDescriptor *d)
+{
+    if (!d || d->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL | AV_PIX_FMT_FLAG_BITSTREAM |
+                          AV_PIX_FMT_FLAG_HWACCEL | AV_PIX_FMT_FLAG_BAYER | AV_PIX_FMT_FLAG_FLOAT |
+                          AV_PIX_FMT_FLAG_BE))
+        return false;
+    if (d->comp[0].depth < 8 || d->comp[0].depth > 16) return false;
+    return d->nb_components == 1 || d->nb_components == 2 || d->nb_components >= 3;
+}
+
+static inline unsigned comp_at(const AVFrame *f, const AVComponentDescriptor *c,
+                               int x, int y)
+{
+    const uint8_t *p = f->data[c->plane] + (ptrdiff_t)y * f->linesize[c->plane] +
+                       (ptrdiff_t)x * c->step + c->offset;
+    if (c->depth <= 8) return p[0];
+    unsigned v = ((unsigned)p[0] | (unsigned)p[1] << 8) >> c->shift;
+    return v >> (c->depth - 8);
+}
+
+/* 解码帧 → 槽位（YUV420P 连续布局）。分辨率变化（rtsp 摄像头切码流、
+   换源后同槽位复用）就地重分配：读方（paint/快照）都在同一把锁内按
+   当时的 w/h 访问，重分配不会越界。奇数宽高向下取偶。 */
 static void slot_store(capture_t *cap, const AVFrame *f)
 {
-    int w = f->width, h = f->height;
+    const AVPixFmtDescriptor *d = av_pix_fmt_desc_get((enum AVPixelFormat)f->format);
+    int w = f->width & ~1, h = f->height & ~1;
+    if (w <= 0 || h <= 0) return;
     size_t ysz = (size_t)w * h, usz = ysz / 4;
     pthread_mutex_lock(&cap->lock);
-    if (cap->slot.data && (cap->slot.w != w || cap->slot.h != h)) {
-        cap->size_drops++;
-        snprintf(cap->last_error, sizeof(cap->last_error),
-                 "dropped %dx%d frame, slot locked at %dx%d", w, h, cap->slot.w, cap->slot.h);
-        pthread_mutex_unlock(&cap->lock);
-        return;
-    }
-    if (!cap->slot.data) {
-        cap->slot.data = malloc(ysz + 2 * usz);
-        if (!cap->slot.data) {
+    if (!cap->slot.data || cap->slot.w != w || cap->slot.h != h) {
+        if (cap->slot.data) {
+            cap->size_changes++;
+            fprintf(stderr, "multicam: 源分辨率 %dx%d → %dx%d，槽位重建\n",
+                    cap->slot.w, cap->slot.h, w, h);
+        }
+        uint8_t *nd = realloc(cap->slot.data, ysz + 2 * usz);
+        if (!nd) {
+            free(cap->slot.data);
+            cap->slot.data = NULL;
             cap->slot.w = cap->slot.h = 0;
             pthread_mutex_unlock(&cap->lock);
             return;
         }
+        cap->slot.data = nd;
         cap->slot.w = w;
         cap->slot.h = h;
     }
-    uint8_t *d = cap->slot.data;
-    for (int row = 0; row < h; row++)
-        memcpy(d + (size_t)row * w, f->data[0] + (size_t)row * f->linesize[0], w);
-    for (int row = 0; row < h / 2; row++)
-        memcpy(d + ysz + (size_t)row * (w / 2), f->data[1] + (size_t)row * f->linesize[1], w / 2);
-    for (int row = 0; row < h / 2; row++)
-        memcpy(d + ysz + usz + (size_t)row * (w / 2), f->data[2] + (size_t)row * f->linesize[2], w / 2);
+    uint8_t *dy = cap->slot.data, *du = dy + ysz, *dv = du + usz;
+    int cw = w / 2, ch = h / 2;
+    if (f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVJ420P) {
+        /* 快路径：yuvj420p 与 yuv420p 内存布局相同 */
+        for (int row = 0; row < h; row++)
+            memcpy(dy + (size_t)row * w, f->data[0] + (size_t)row * f->linesize[0], w);
+        for (int row = 0; row < ch; row++) {
+            memcpy(du + (size_t)row * cw, f->data[1] + (size_t)row * f->linesize[1], cw);
+            memcpy(dv + (size_t)row * cw, f->data[2] + (size_t)row * f->linesize[2], cw);
+        }
+    } else {
+        const AVComponentDescriptor *cy = &d->comp[0];
+        for (int row = 0; row < h; row++) {
+            uint8_t *o = dy + (size_t)row * w;
+            if (cy->depth == 8 && cy->step == 1 && cy->offset == 0)
+                memcpy(o, f->data[cy->plane] + (size_t)row * f->linesize[cy->plane], w);
+            else
+                for (int x = 0; x < w; x++) o[x] = (uint8_t)comp_at(f, cy, x, row);
+        }
+        if (d->nb_components >= 3) {
+            /* 输出色度点 (c,r) 对应亮度 (2c,2r)，按源色度下采样比例换算 */
+            int sw = d->log2_chroma_w, sh = d->log2_chroma_h;
+            for (int r = 0; r < ch; r++) {
+                int sr = (2 * r) >> sh;
+                uint8_t *ou = du + (size_t)r * cw, *ov = dv + (size_t)r * cw;
+                for (int c = 0; c < cw; c++) {
+                    int sc = (2 * c) >> sw;
+                    ou[c] = (uint8_t)comp_at(f, &d->comp[1], sc, sr);
+                    ov[c] = (uint8_t)comp_at(f, &d->comp[2], sc, sr);
+                }
+            }
+        } else {
+            memset(du, 128, 2 * usz);   /* 灰度源 */
+        }
+    }
     cap->slot.updated_ms = now_ms();
     cap->slot.frame_count++;
+    cap->note[0] = 0;
     pthread_mutex_unlock(&cap->lock);
+}
+
+/* ffmpeg 打开失败 → 面板可读原因（rtsp 状态码经 ff_http_averror 映射） */
+static const char *open_error_note(int rc)
+{
+    if (rc == AVERROR_HTTP_UNAUTHORIZED) return "认证失败（用户名或密码错误）";
+    if (rc == AVERROR_HTTP_FORBIDDEN) return "无访问权限（403）";
+    if (rc == AVERROR_HTTP_NOT_FOUND) return "地址路径不存在（404）";
+    if (rc == AVERROR_HTTP_BAD_REQUEST || rc == AVERROR_HTTP_OTHER_4XX) return "摄像头拒绝请求（检查地址路径）";
+    if (rc == AVERROR_HTTP_SERVER_ERROR) return "摄像头内部错误（5xx）";
+    if (rc == AVERROR(ECONNREFUSED)) return "连接被拒绝（端口错误或未开启 RTSP）";
+    if (rc == AVERROR(ETIMEDOUT)) return "连接超时（IP 不通或被拦截）";
+    if (rc == AVERROR(EHOSTUNREACH) || rc == AVERROR(ENETUNREACH)) return "网络不可达（检查 IP）";
+    if (rc == AVERROR_PROTOCOL_NOT_FOUND) return "不支持的协议（仅支持 rtsp://）";
+    return NULL;
+}
+
+static int interrupt_cb(void *opaque)
+{
+    return ((capture_t *)opaque)->stop ? 1 : 0;
+}
+
+/* 可被 stop 打断的等待（换源时不让主循环干等重连间隔） */
+static void sleep_unless_stop(capture_t *cap, int ms)
+{
+    for (int t = 0; t < ms && !cap->stop; t += 100) usleep(100 * 1000);
 }
 
 static int open_stream(capture_t *cap, AVFormatContext **fmt_out, AVCodecContext **dec_out,
@@ -81,8 +175,12 @@ static int open_stream(capture_t *cap, AVFormatContext **fmt_out, AVCodecContext
     *dec_out = NULL;
     char errbuf[128];
     AVFormatContext *fmt = avformat_alloc_context();
+    if (!fmt) return -1;
+    fmt->interrupt_callback.callback = interrupt_cb;   /* stop 时打断阻塞的连接/读 */
+    fmt->interrupt_callback.opaque = cap;
     AVDictionary *opts = NULL;
-    av_dict_set(&opts, "rtsp_transport", "tcp", 0);
+    /* 默认 TCP 交错（丢包不花屏）；摄像头拒绝 TCP 时自动改试 UDP */
+    av_dict_set(&opts, "rtsp_transport", cap->rtsp_udp ? "udp" : "tcp", 0);
     av_dict_set(&opts, "stimeout", "5000000", 0); /* 5s socket 超时(µs) */
     av_dict_set(&opts, "probesize", "262144", 0);        /* 探测缓冲上限 256KB（省启动峰值） */
     av_dict_set(&opts, "analyzeduration", "1000000", 0); /* 流分析上限 1s */
@@ -90,32 +188,53 @@ static int open_stream(capture_t *cap, AVFormatContext **fmt_out, AVCodecContext
     av_dict_free(&opts);
     if (rc < 0) {
         av_strerror(rc, errbuf, sizeof(errbuf));
-        snprintf(cap->last_error, sizeof(cap->last_error), "open_input rc=%d %s", rc, errbuf);
+        snprintf(cap->last_error, sizeof(cap->last_error), "open_input(%s) rc=%d %s",
+                 cap->rtsp_udp ? "udp" : "tcp", rc, errbuf);
+        const char *note = open_error_note(rc);
+        if (!note) {
+            /* 原因不明（多为 SETUP 传输协商失败）：下次换另一种传输再试 */
+            cap->rtsp_udp = !cap->rtsp_udp;
+            note = "无法建立视频会话（已自动改试其他传输方式）";
+        }
+        set_note(cap, note);
         return -1;
     }
     if (avformat_find_stream_info(fmt, NULL) < 0) {
         snprintf(cap->last_error, sizeof(cap->last_error), "find_stream_info failed");
+        set_note(cap, "无法识别视频流");
         avformat_close_input(&fmt);
         return -1;
     }
     int idx = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     if (idx < 0) {
         snprintf(cap->last_error, sizeof(cap->last_error), "no video stream");
+        set_note(cap, "地址里没有视频流");
         avformat_close_input(&fmt);
         return -1;
     }
-    const AVCodec *codec = avcodec_find_decoder(fmt->streams[idx]->codecpar->codec_id);
+    AVCodecParameters *par = fmt->streams[idx]->codecpar;
+    const AVCodec *codec = avcodec_find_decoder(par->codec_id);
     if (!codec) {
-        snprintf(cap->last_error, sizeof(cap->last_error), "no decoder");
+        snprintf(cap->last_error, sizeof(cap->last_error), "no decoder (%s)",
+                 avcodec_get_name(par->codec_id));
+        set_note(cap, "视频编码不支持（仅 H.264 / H.265 / MJPEG）");
+        avformat_close_input(&fmt);
+        return -1;
+    }
+    if ((int64_t)par->width * par->height > CAPTURE_MAX_PIXELS) {
+        snprintf(cap->last_error, sizeof(cap->last_error), "source %dx%d too large",
+                 par->width, par->height);
+        set_note(cap, "分辨率过高（请改用 1080p 以下的子码流）");
         avformat_close_input(&fmt);
         return -1;
     }
     AVCodecContext *dec = avcodec_alloc_context3(codec);
-    avcodec_parameters_to_context(dec, fmt->streams[idx]->codecpar);
+    avcodec_parameters_to_context(dec, par);
     /* 单核 A53：多线程帧解码只放大参考帧缓冲（每线程一套，~MB 级）不提速 */
     dec->thread_count = 1;
     if (avcodec_open2(dec, codec, NULL) < 0) {
         snprintf(cap->last_error, sizeof(cap->last_error), "avcodec_open2 failed");
+        set_note(cap, "解码器打开失败");
         avcodec_free_context(&dec);
         avformat_close_input(&fmt);
         return -1;
@@ -168,9 +287,12 @@ static int drain_frames(capture_t *cap, AVCodecContext *dec, AVFrame *frm)
 {
     int rc;
     while ((rc = avcodec_receive_frame(dec, frm)) >= 0) {
-        if (frm->format == AV_PIX_FMT_YUV420P ||
-            frm->format == AV_PIX_FMT_YUVJ420P) {
-            slot_store(cap, frm);   /* yuvj420p 与 yuv420p 内存布局相同 */
+        if (frm->format == AV_PIX_FMT_YUV420P || frm->format == AV_PIX_FMT_YUVJ420P ||
+            pixfmt_convertible(av_pix_fmt_desc_get((enum AVPixelFormat)frm->format))) {
+            if ((int64_t)frm->width * frm->height <= CAPTURE_MAX_PIXELS)
+                slot_store(cap, frm);
+            else
+                set_note(cap, "分辨率过高（请改用 1080p 以下的子码流）");
         } else {
             if (frm->format != cap->warned_fmt) {
                 cap->warned_fmt = frm->format;
@@ -178,6 +300,7 @@ static int drain_frames(capture_t *cap, AVCodecContext *dec, AVFrame *frm)
                         av_get_pix_fmt_name((enum AVPixelFormat)frm->format));
             }
             cap->pixfmt_drops++;
+            set_note(cap, "画面像素格式不支持");
         }
         av_frame_unref(frm);
     }
@@ -194,7 +317,7 @@ static void *capture_thread(void *arg)
         AVCodecContext *dec = NULL;
         int idx = -1;
         if (open_stream(cap, &fmt, &dec, &idx) != 0) {
-            usleep(3 * 1000 * 1000);
+            sleep_unless_stop(cap, 3000);
             continue;
         }
         cap->burst_left = 0; /* 新会话，窗口预算重置（keyint 测量保留） */
@@ -205,6 +328,7 @@ static void *capture_thread(void *arg)
             int rc = av_read_frame(fmt, pkt);
             if (rc < 0) {
                 snprintf(cap->last_error, sizeof(cap->last_error), "av_read_frame rc=%d", rc);
+                if (!cap->stop) set_note(cap, "视频流中断，正在重连");
                 alive = false;
                 break;
             }
@@ -223,7 +347,7 @@ static void *capture_thread(void *arg)
         avformat_close_input(&fmt);
         if (!cap->stop) {
             cap->reconnects++;
-            usleep(3 * 1000 * 1000);
+            sleep_unless_stop(cap, 3000);
         }
     }
     return NULL;
@@ -604,16 +728,27 @@ int capture_snapshot_jpeg(capture_t *cap, uint8_t *buf, size_t buf_cap)
         return -1;
     }
     int w = cap->slot.w, h = cap->slot.h;
+    /* 快照尺寸：源宽 >848 时等比缩小（1080p 全幅 JPEG 经 base64 回传太大） */
+    int sw = w, sh = h;
+    if (sw > 848) {
+        sw = 848;
+        sh = (int)((int64_t)h * 848 / w) & ~1;
+    }
 
-    /* 编码器/输入帧懒初始化（槽位分辨率按首帧锁定，运行期不变） */
+    /* 编码器/输入帧懒初始化；源分辨率变化后尺寸不符则重建 */
     AVCodecContext *enc = cap->snap_enc;
+    if (enc && (enc->width != sw || enc->height != sh)) {
+        avcodec_free_context(&enc);
+        av_frame_free((AVFrame **)&cap->snap_frm);
+        cap->snap_enc = NULL;
+    }
     if (!enc) {
         const AVCodec *c = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
         if (!c) { pthread_mutex_unlock(&cap->lock); return -1; }
         enc = avcodec_alloc_context3(c);
         if (!enc) { pthread_mutex_unlock(&cap->lock); return -1; }
-        enc->width = w;
-        enc->height = h;
+        enc->width = sw;
+        enc->height = sh;
         enc->pix_fmt = AV_PIX_FMT_YUVJ420P;
         enc->time_base = (AVRational){1, 5};
         enc->qmin = 8;   /* 质量/体积平衡：848x480 室内场景 ~40-90KB */
@@ -631,8 +766,8 @@ int capture_snapshot_jpeg(capture_t *cap, uint8_t *buf, size_t buf_cap)
         }
         /* format/尺寸必须先于 get_buffer 设置，否则缓冲分配失败 */
         f->format = enc->pix_fmt;
-        f->width = w;
-        f->height = h;
+        f->width = sw;
+        f->height = sh;
         if (av_frame_get_buffer(f, 32) < 0) {
             av_frame_free(&f);
             avcodec_free_context(&enc);
@@ -644,14 +779,34 @@ int capture_snapshot_jpeg(capture_t *cap, uint8_t *buf, size_t buf_cap)
     }
     AVFrame *f = cap->snap_frm;
 
-    /* 槽位（连续平面）→ 编码帧（行距对齐），~600KB 拷贝在锁内 ~1ms */
+    /* 槽位（连续平面）→ 编码帧（行距对齐），拷贝在锁内 ~1ms；
+       缩小时最近邻取样（只给人看取景位置，不需要插值） */
     size_t ysz = (size_t)w * h, usz = ysz / 4;
     const uint8_t *src = cap->slot.data;
-    for (int row = 0; row < h; row++)
-        memcpy(f->data[0] + (size_t)row * f->linesize[0], src + (size_t)row * w, w);
-    for (int row = 0; row < h / 2; row++) {
-        memcpy(f->data[1] + (size_t)row * f->linesize[1], src + ysz + (size_t)row * (w / 2), w / 2);
-        memcpy(f->data[2] + (size_t)row * f->linesize[2], src + ysz + usz + (size_t)row * (w / 2), w / 2);
+    if (sw == w) {
+        for (int row = 0; row < h; row++)
+            memcpy(f->data[0] + (size_t)row * f->linesize[0], src + (size_t)row * w, w);
+        for (int row = 0; row < h / 2; row++) {
+            memcpy(f->data[1] + (size_t)row * f->linesize[1], src + ysz + (size_t)row * (w / 2), w / 2);
+            memcpy(f->data[2] + (size_t)row * f->linesize[2], src + ysz + usz + (size_t)row * (w / 2), w / 2);
+        }
+    } else {
+        for (int row = 0; row < sh; row++) {
+            const uint8_t *sr = src + (size_t)((int64_t)row * h / sh) * w;
+            uint8_t *d = f->data[0] + (size_t)row * f->linesize[0];
+            for (int x = 0; x < sw; x++) d[x] = sr[(int64_t)x * w / sw];
+        }
+        int cw = w / 2, ch = h / 2, scw = sw / 2, sch = sh / 2;
+        for (int row = 0; row < sch; row++) {
+            size_t so = (size_t)((int64_t)row * ch / sch) * cw;
+            uint8_t *du = f->data[1] + (size_t)row * f->linesize[1];
+            uint8_t *dv = f->data[2] + (size_t)row * f->linesize[2];
+            for (int x = 0; x < scw; x++) {
+                int sx = (int)((int64_t)x * cw / scw);
+                du[x] = src[ysz + so + sx];
+                dv[x] = src[ysz + usz + so + sx];
+            }
+        }
     }
     pthread_mutex_unlock(&cap->lock);
 
@@ -690,6 +845,7 @@ void capture_stop(capture_t *cap)
     pthread_mutex_destroy(&cap->lock);
     free(cap->slot.data);
     cap->slot.data = NULL;
+    cap->slot.w = cap->slot.h = 0;
     free(cap->aiv1_buf);
     cap->aiv1_buf = NULL;
     cap->aiv1_buf_cap = 0;
@@ -784,88 +940,119 @@ int64_t capture_paint_crop(capture_t *cap, uint8_t *dst_y, uint8_t *dst_u, uint8
     return age;
 }
 
-/* 缩放映射表宽度上限（crop_1x2 的 tile 固定 400，留余量到 512） */
-#define SQUEEZE_MAX_W 512
+/* 缩放映射表上限（crop_1x2 的 tile 固定 400×480，留余量） */
+#define FIT_MAX_W 512
+#define FIT_MAX_H 512
 
-int64_t capture_paint_squeeze(capture_t *cap, uint8_t *dst_y, uint8_t *dst_u, uint8_t *dst_v,
-                              int dst_y_stride, int dst_c_stride,
-                              int crop_x, int crop_y,
-                              int win_w, int win_h,
-                              int out_w, int out_h)
+int capture_fit_window(int src_w, int src_h, int squeeze_pct, int out_w, int out_h)
 {
-    if (out_w <= 0 || out_w > SQUEEZE_MAX_W || out_w & 1) return -3;
+    if (src_w <= 0 || src_h <= 0 || out_h <= 0) return 0;
+    if (squeeze_pct < 100) squeeze_pct = 100;
+    int win = (int)((int64_t)src_h * out_w * squeeze_pct / ((int64_t)out_h * 100)) & ~1;
+    if (win > src_w) win = src_w & ~1;
+    if (win < 2) win = 2;
+    return win;
+}
+
+/* 一维采样表：输出 n 点映射到窗口 [org, org+win) 内的双线性两点与权重（0..256）。
+   采样中心对齐：s = (i+0.5)·win/n − 0.5，相对窗口起点，取下标再加 org */
+static void build_axis(int n, int win, int org, int16_t *i0, int16_t *i1, int16_t *fw)
+{
+    for (int i = 0; i < n; i++) {
+        double sp = (i + 0.5) * (double)win / n - 0.5;
+        int a = (int)sp;
+        if (a < 0) a = 0;
+        if (a > win - 1) a = win - 1;
+        int b = a + 1 < win ? a + 1 : a;
+        double f = sp - a;
+        if (f < 0) f = 0;
+        if (f > 1) f = 1;
+        i0[i] = (int16_t)(org + a);
+        i1[i] = (int16_t)(org + b);
+        fw[i] = (int16_t)(f * 256 + 0.5);
+    }
+}
+
+/* 单平面二维双线性：src 行距 sstride，输出 ow×oh */
+static void scale_plane(const uint8_t *src, int sstride, uint8_t *dst, int dstride,
+                        int ow, int oh,
+                        const int16_t *x0, const int16_t *x1, const int16_t *xf,
+                        const int16_t *y0, const int16_t *y1, const int16_t *yf)
+{
+    for (int r = 0; r < oh; r++) {
+        const uint8_t *ra = src + (size_t)y0[r] * sstride;
+        const uint8_t *rb = src + (size_t)y1[r] * sstride;
+        uint8_t *d = dst + (size_t)r * dstride;
+        int fy = yf[r];
+        if (fy == 0) {          /* 行对齐（垂直 1:1，如 480 高源）：只做水平插值 */
+            for (int x = 0; x < ow; x++)
+                d[x] = (uint8_t)((ra[x0[x]] * (256 - xf[x]) + ra[x1[x]] * xf[x] + 128) >> 8);
+            continue;
+        }
+        for (int x = 0; x < ow; x++) {
+            int ha = ra[x0[x]] * (256 - xf[x]) + ra[x1[x]] * xf[x];
+            int hb = rb[x0[x]] * (256 - xf[x]) + rb[x1[x]] * xf[x];
+            d[x] = (uint8_t)((ha * (256 - fy) + hb * fy + 32768) >> 16);
+        }
+    }
+}
+
+int64_t capture_paint_fit(capture_t *cap, uint8_t *dst_y, uint8_t *dst_u, uint8_t *dst_v,
+                          int dst_y_stride, int dst_c_stride,
+                          int crop_x, int squeeze_pct, int out_w, int out_h,
+                          int *src_w, int *src_h, int *win_w)
+{
+    if (out_w <= 0 || out_h <= 0 || out_w > FIT_MAX_W || out_h > FIT_MAX_H ||
+        (out_w | out_h) & 1)
+        return -3;
     pthread_mutex_lock(&cap->lock);
     if (!cap->slot.data) {
         pthread_mutex_unlock(&cap->lock);
         return -1;
     }
     int w = cap->slot.w, h = cap->slot.h;
-    if (win_w <= 0 || win_h <= 0 || win_h != out_h || h < win_h || win_w & 1) {
-        pthread_mutex_unlock(&cap->lock);
-        return -2;
-    }
-    if (w < win_w) {   /* 窗口宽于源（低分辨率 rtsp 源）：收敛为整幅 */
-        win_w = w & ~1;
-        crop_x = 0;
-    }
-    crop_x &= ~1;   /* 与 capture_paint_crop 一致：色度平面半宽，奇数起点会半像素错位 */
-    crop_y &= ~1;
-    if (crop_y < 0) crop_y = 0;
-    if (crop_y + win_h > h) crop_y = (h - win_h) & ~1;
-    if (crop_x < 0) crop_x = (w - win_w) / 2 & ~1;
-    if (crop_x > w - win_w) crop_x = (w - win_w) & ~1;
-
-    /* 水平映射表：亮度与色度各自建（采样中心对齐，缩放比相同但原点差半像素）。
-       f 取 0..256 定点，(a*(256-f)+b*f+128)>>8 双线性插值，f=0 退化为直拷。 */
-    int16_t lx0[SQUEEZE_MAX_W], lx1[SQUEEZE_MAX_W], lfw[SQUEEZE_MAX_W];
-    int16_t cx0[SQUEEZE_MAX_W / 2], cx1[SQUEEZE_MAX_W / 2], cfw[SQUEEZE_MAX_W / 2];
-    for (int x = 0; x < out_w; x++) {
-        double s = (x + 0.5) * (double)win_w / out_w - 0.5;   /* 窗口内相对坐标，下方再加 crop_x */
-        int x0 = (int)s;
-        if (x0 < 0) x0 = 0;
-        if (x0 > win_w - 1) x0 = win_w - 1;
-        int x1 = x0 + 1 < win_w ? x0 + 1 : x0;
-        double f = s - x0;
-        if (f < 0) f = 0;
-        if (f > 1) f = 1;
-        lx0[x] = (int16_t)(crop_x + x0);
-        lx1[x] = (int16_t)(crop_x + x1);
-        lfw[x] = (int16_t)(f * 256 + 0.5);
-    }
-    int cw_out = out_w / 2, cw_win = win_w / 2, cw_crop = crop_x / 2;
-    for (int x = 0; x < cw_out; x++) {
-        double s = (x + 0.5) * (double)cw_win / cw_out - 0.5;
-        int x0 = (int)s;
-        if (x0 < 0) x0 = 0;
-        if (x0 > cw_win - 1) x0 = cw_win - 1;
-        int x1 = x0 + 1 < cw_win ? x0 + 1 : x0;
-        double f = s - x0;
-        if (f < 0) f = 0;
-        if (f > 1) f = 1;
-        cx0[x] = (int16_t)(cw_crop + x0);
-        cx1[x] = (int16_t)(cw_crop + x1);
-        cfw[x] = (int16_t)(f * 256 + 0.5);
-    }
+    int ww = capture_fit_window(w, h, squeeze_pct, out_w, out_h);
+    if (src_w) *src_w = w;
+    if (src_h) *src_h = h;
+    if (win_w) *win_w = ww;
+    if (crop_x < 0) crop_x = (w - ww) / 2;
+    if (crop_x > w - ww) crop_x = w - ww;
+    crop_x &= ~1;   /* 色度平面半宽：奇数起点会半像素错位 */
 
     const uint8_t *src = cap->slot.data;
     size_t ysz = (size_t)w * h, usz = ysz / 4;
-    for (int row = 0; row < out_h; row++) {
-        const uint8_t *sy = src + (size_t)(crop_y + row) * w;
-        uint8_t *dy = dst_y + (size_t)row * dst_y_stride;
-        for (int x = 0; x < out_w; x++)
-            dy[x] = (uint8_t)((sy[lx0[x]] * (256 - lfw[x]) + sy[lx1[x]] * lfw[x] + 128) >> 8);
-    }
-    for (int row = 0; row < out_h / 2; row++) {
-        const uint8_t *su = src + ysz + (size_t)(crop_y / 2 + row) * (w / 2);
-        const uint8_t *sv = su + usz;
-        uint8_t *du = dst_u + (size_t)row * dst_c_stride;
-        uint8_t *dv = dst_v + (size_t)row * dst_c_stride;
-        for (int x = 0; x < cw_out; x++) {
-            du[x] = (uint8_t)((su[cx0[x]] * (256 - cfw[x]) + su[cx1[x]] * cfw[x] + 128) >> 8);
-            dv[x] = (uint8_t)((sv[cx0[x]] * (256 - cfw[x]) + sv[cx1[x]] * cfw[x] + 128) >> 8);
+    if (ww == out_w && h == out_h) {
+        /* 窗口与 tile 等大（848×480 源 1.0×）：逐行直拷 */
+        for (int row = 0; row < out_h; row++)
+            memcpy(dst_y + (size_t)row * dst_y_stride, src + (size_t)row * w + crop_x, out_w);
+        for (int row = 0; row < out_h / 2; row++) {
+            memcpy(dst_u + (size_t)row * dst_c_stride,
+                   src + ysz + (size_t)row * (w / 2) + crop_x / 2, out_w / 2);
+            memcpy(dst_v + (size_t)row * dst_c_stride,
+                   src + ysz + usz + (size_t)row * (w / 2) + crop_x / 2, out_w / 2);
         }
+    } else {
+        int16_t lx0[FIT_MAX_W], lx1[FIT_MAX_W], lxf[FIT_MAX_W];
+        int16_t ly0[FIT_MAX_H], ly1[FIT_MAX_H], lyf[FIT_MAX_H];
+        build_axis(out_w, ww, crop_x, lx0, lx1, lxf);
+        build_axis(out_h, h, 0, ly0, ly1, lyf);
+        scale_plane(src, w, dst_y, dst_y_stride, out_w, out_h, lx0, lx1, lxf, ly0, ly1, lyf);
+        /* 色度：同比例、原点按半分辨率各自对齐 */
+        build_axis(out_w / 2, ww / 2, crop_x / 2, lx0, lx1, lxf);
+        build_axis(out_h / 2, h / 2, 0, ly0, ly1, lyf);
+        scale_plane(src + ysz, w / 2, dst_u, dst_c_stride, out_w / 2, out_h / 2,
+                    lx0, lx1, lxf, ly0, ly1, lyf);
+        scale_plane(src + ysz + usz, w / 2, dst_v, dst_c_stride, out_w / 2, out_h / 2,
+                    lx0, lx1, lxf, ly0, ly1, lyf);
     }
     int64_t age = now_ms() - cap->slot.updated_ms;
     pthread_mutex_unlock(&cap->lock);
     return age;
+}
+
+void capture_note(capture_t *cap, char *out, size_t cap_len)
+{
+    pthread_mutex_lock(&cap->lock);
+    snprintf(out, cap_len, "%s", cap->note);
+    pthread_mutex_unlock(&cap->lock);
 }

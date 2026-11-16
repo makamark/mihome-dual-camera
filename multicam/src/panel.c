@@ -122,6 +122,7 @@ static int handle_status_get(ainice_bridge_response_t *response)
         cJSON_AddNumberToObject(o, "crop_x", t->crop_x);
         cJSON_AddNumberToObject(o, "src_w", t->src_w);
         cJSON_AddNumberToObject(o, "src_h", t->src_h);
+        cJSON_AddNumberToObject(o, "win_w", t->win_w);
         cJSON_AddNumberToObject(o, "g2r_port", t->g2r_port);
         cJSON_AddStringToObject(o, "g2r_user", t->g2r_user);
         cJSON_AddStringToObject(o, "g2r_pass", t->g2r_pass);

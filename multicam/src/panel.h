@@ -24,7 +24,8 @@ typedef struct {
     int g2r_rss_kb;       /* go2rtc 子进程常驻内存（0=不在场） */
     bool g2r_alive;
     int crop_x;           /* 当前水平裁切起点 */
-    int src_w, src_h;     /* 源画面原始分辨率 */
+    int src_w, src_h;     /* 该路源画面实际分辨率（0=尚无帧） */
+    int win_w;            /* 该路取景窗口宽（源像素；窗口高=源全高） */
     bool aiv1;            /* 输入通路：true=AIV1 直消费（米家路），false=RTSP 直连 */
 } panel_tile_t;
 
@@ -36,7 +37,7 @@ typedef struct {
     int tile_w, tile_h;   /* 单 tile 尺寸（面板叠加/标定的几何换算用） */
     int layout_cols;      /* tile 网格列数（1 = 竖排） */
     int squeeze_pct;      /* 横向压缩系数 ×100（100 = 不压缩） */
-    int win_w;            /* crop_1x2 每路取景窗口宽（取景器蓝框宽度） */
+    int win_w;            /* 兼容字段：第 1 路取景窗口宽（逐路值见 tiles[].win_w） */
     uint64_t frames;
     int session_failures;
     int n_slots, n_cams;
